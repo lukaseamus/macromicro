@@ -50,3 +50,6 @@ rsconnect/
 
 # macOS specific
 .DS_store
+
+# generic R plots
+Rplot.pdf
