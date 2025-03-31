@@ -52,4 +52,5 @@ rsconnect/
 .DS_store
 
 # generic R plots
-Rplot.pdf
+*.pdf
+*.png
