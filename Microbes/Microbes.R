@@ -74,6 +74,7 @@ kinetics %>%
         ggplot(aes(Concentration, Fluorescence)) +
           geom_point() +
           geom_line() +
+          # coord_cartesian(xlim = c(0, 0.5), ylim = c(0, 2e3)) + # unhash to see intercept
           theme_minimal()
       ) %>%
   wrap_plots()
@@ -184,71 +185,65 @@ kinetics_standard_ht_samples <- kinetics %>%
 
 # 2.1.3 Model checks ####
 # check Rhat, effective sample size and chains
-kinetics_standard_ht_summary <- kinetics_standard_ht_samples %>%
-  map(~ .x$summary())
-
-kinetics_standard_ht_summary %>%
+kinetics_standard_ht_samples %>%
+  map(~ .x$summary()) %>%
   bind_rows() %>%
-  filter(rhat > 1.001)
-# no Rhat above 1.001
-
-kinetics_standard_ht_summary %>%
-  bind_rows() %>%
-  summarise(rhat_mean = mean(rhat),
+  mutate(rhat_check = rhat > 1.001) %>%
+  summarise(rhat_1.001 = sum(rhat_check),
+            rhat_mean = mean(rhat),
             rhat_sd = sd(rhat),
             ess_mean = mean(ess_bulk),
-            ess_sd = sd(ess_bulk))
-# great Rhat and effective sample size
-
-kinetics_standard_ht_draws <- kinetics_standard_ht_samples %>%
-  map(~ .x$draws(format = "df"))
+            ess_sd = sd(ess_bulk)) 
+# no rhat above 1.001
+# good effective sample size
 
 require(bayesplot)
-kinetics_standard_ht_draws %>%
-  map(~ mcmc_rank_overlay(.x)) %>%
+kinetics_standard_ht_samples %>%
+  map(~ .x$draws(format = "df") %>%
+        mcmc_rank_overlay()) %>%
   wrap_plots() +
   plot_layout(guides = "collect") &
   theme(legend.position = "top")
 # chains look good
 
-kinetics_standard_ht_draws %>%
-  map(~ mcmc_pairs(.x, pars = c("Fmax", "beta", "F0"))) %>%
+kinetics_standard_ht_samples %>%
+  map(~ .x$draws(format = "df") %>%
+        mcmc_pairs(pars = c("Fmax", "beta", "F0"))) %>%
   wrap_plots()
 # practically no correlation
 
 # 2.1.4 Prior-posterior comparison ####
-kinetics_standard_ht_prior_posterior <- kinetics_standard_ht_samples %>%
-  map(~ spread_draws(.x, Fmax, beta, F0, sigma) %>%
-        ungroup() %>%
-        mutate(
-          sigma_prior = rexp(length(.draw), 1),
-          F0_prior = rgamma(length(.draw), 500^2 / 300^2, 500 / 300^2),
-          beta_prior = rgamma(length(.draw), 5e3^2 / 3e3^2, 5e3 / 3e3^2),
-          Fmax_prior = rgamma(length(.draw), 24e4^2 / 5e4^2, 24e4 / 5e4^2)
-        )
-  )
+source("functions.R")
+# sample prior
+kinetics_standard_ht_prior_samples <- kinetics %>%
+  map(~ prior_samples(model = kinetics_standard_ht_mod,
+                      data = .x$standard %>%
+                        select(Fluorescence, Concentration) %>%
+                        compose_data(),
+                      chains = 8, samples = 1e4))
 
-str(kinetics_standard_ht_prior_posterior)
+# merge priors and posteriors
+kinetics_standard_ht_prior_posterior <- kinetics_standard_ht_prior_samples %>%
+  map2(kinetics_standard_ht_samples, 
+       ~ prior_posterior_draws(prior_samples = .x, 
+                               posterior_samples = .y,
+                               group = list(NA), # no groups so this hast to be an empty list or tibble
+                               parameters = c("Fmax", "beta", "F0", "sigma"),
+                               format = "long"))
 
+# plot prior-posterior comparison
 kinetics_standard_ht_prior_posterior %>%
-  map(~ pivot_longer(., cols = c("F0", "F0_prior", "beta", "beta_prior", "Fmax", "Fmax_prior"),
-                     names_to = c("Parameter", "Distribution"),
-                     names_sep = "_", # this will produce NAs and throw a warning message
-                     values_to = "Samples") %>%
-        mutate(Parameter = fct(Parameter),
-               Distribution = fct(ifelse(is.na(Distribution), # here the NAs are dealt with
-                                         "posterior", Distribution))) %>%
-        ggplot(aes(Samples, fill = Distribution)) +
-        facet_wrap(~ Parameter, scales = "free", nrow = 1) +
-        geom_density(colour = NA, alpha = 0.5) +
-        theme_minimal() +
-        theme(legend.position = "top", legend.justification = 0)) %>%
+  map(~ prior_posterior_plot(.x, group = NA)) %>%
   wrap_plots() +
   plot_layout(guides = "collect") &
   theme(legend.position = "top")
-# priors are not restrictive
+# priors are not too restrictive, but the data are informing unexpectedly high F0
 
 # 2.1.5 Predictions for mu ####
+
+
+
+
 kinetics_standard_ht_mu <- kinetics_standard_ht_prior_posterior %>%
   map2(kinetics,
        ~ .x %>% select(Fmax, beta, F0) %>%
@@ -594,7 +589,8 @@ kinetics %>%
   wrap_plots()
 # rectangular hyperbola is clearly the best!
 # it only slightly overestimates the intercept when beta is low
-# and underestimates it when beta is high
+# and underestimates it when beta is high, but that is less worrisome 
+# because I will adjust the intercept based on water autofluorescence
 
 # 2.1.16 Compare functions ####
 kinetics_standard_mu_summary <- 
@@ -651,9 +647,10 @@ kinetics_samples %>%
   plot_layout(guides = "collect") &
   theme(legend.position = "top")
 # These data are exceptionally messy, likely due to bad pipetting, and not worth analysing.
-# There is no indication of saturation, with the highest enzyme activity always found at the highest
-# substrate concentration. I ended up deciding on 1000 µM as the saturating substrate concentration
-# due to logistical reasons.
+# There was also no correction for the autofluorescence difference between water and methanol,
+# so there are impossible negative values. There is no indication of saturation, with the highest 
+# enzyme activity always found at the highest substrate concentration. I ended up deciding on 
+# 1000 µM as the saturating substrate concentration due to logistical reasons.
 
 # 3. Baseline fluorescence ####
 enzyme$X031121enzyme9 %>%
@@ -673,7 +670,7 @@ enzyme$X031121enzyme9 %>%
 # It follows that
 # 1. The standard curve, which is made up with 100% methanol, needs to be corrected using a water blank
 # 2. The water reference can be either MilliQ or autoclaved seawater
-# 3. The control can be either MilliQ or autoclaved seawater
+# 3. The substrate control can be either MilliQ or autoclaved seawater
 
 # 4. Experimental samples ####
 experimental <- enzyme %>%
@@ -893,122 +890,145 @@ experimental %>%
   ) %>%
   wrap_plots() %>% # too large to view in RStudio
   ggsave(filename = "blank_data.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
-# there are four plates missing blanks, which will have to be substituted with an average
+# There are four plates missing blanks, which will have to be substituted with an average.
+# This is best done with hierarchical modelling, which requires that the data be combined.
 
 # 4.2.1 Prior simulation ####
-# Water autofluorescence is on average 150 arbitrary units relative to maximal 100 µM standard fluorescence.
-# Since fluorescence cannot be negative, a gamma distribution is best
+# Water autofluorescence is around 200 arbitrary units relative to maximal 100 µM standard fluorescence.
+# Since fluorescence cannot be negative, a gamma distribution is best as the likelihood. To properly 
+# simulate the outcome we need to transform the normal parameter distribution by exponentiating. While
+# the mean can simply be said to the logarithm of the expected mean, the sd must be simulated.
 
 ggplot() +
-  geom_density(aes(rgamma(1e5, 150^2 / 50^2, 150 / 50^2))) +
+  geom_density(aes(rnorm(1e5, log(200), 1) %>% exp())) +
   theme_minimal()
-# seems reasonable
+# lots of variability
+
+# here is the underlying distribution
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(200), 1))) +
+  theme_minimal()
 
 # 4.2.2 Run model ####
 experimental_blank_stan <- "
 data{
   int n;
   vector<lower=0>[n] Fluorescence;
+  array[n] int Group;
+  int n_Group;
 }
 
 parameters{
-  real<lower=0> Fmu;
+  real Fmu_mu; // Hyperparameters
+  real<lower=0> Fmu_sigma;
+  
+  vector[n_Group] Fmu;
+  
   real<lower=0> sigma;
 }
 
 model{
-  // Priors
-  Fmu ~ gamma( 150^2 / 50^2, 150 / 50^2 );
+  // Hyperpriors
+  Fmu_mu ~ normal( log(200) , 1 );
+  Fmu_sigma ~ exponential( 1 );
+  
+  // Group-level prior
+  Fmu ~ normal( Fmu_mu , Fmu_sigma );
+  
   sigma ~ exponential( 1 );
 
   // Model
   vector[n] mu;
   for ( i in 1:n ) {
-    mu[i] = Fmu;
+    mu[i] = exp( Fmu[Group[i]] ); // Exponential transformation
   }
 
-  // Likelihood
-  Fluorescence ~ normal( mu , sigma );
+  // Gamma likelihood (generalsied linear model)
+  Fluorescence ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
 }
 "
 
-experimental_blank_mod <- cmdstan_model(stan_file = write_stan_file(code = experimental_blank_stan))
+experimental_blank_mod <- experimental_blank_stan %>%
+  write_stan_file() %>%
+  cmdstan_model()
 
-experimental_blank_samples <- experimental %>%
-  map(~ experimental_blank_mod$sample(data = .x$blank %>%
-                                            select(Fluorescence) %>%
-                                            compose_data(),
-                                      chains = 8,
-                                      parallel_chains = parallel::detectCores(),
-                                      iter_warmup = 1e4,
-                                      iter_sampling = 1e4)
-      )
+experimental_blank_samples <- experimental_blank_mod$sample(
+  data = experimental %>% 
+    imap(~ .x$blank %>% # here I am creating the unique plate grouping variable
+          mutate(Group = .y %>% fct())) %>% 
+    bind_rows() %>% # here I am combining the blank dataframes to compare across plates
+    select(Fluorescence, Group) %>%
+    compose_data(),
+  chains = 8,
+  parallel_chains = parallel::detectCores(),
+  iter_warmup = 1e4,
+  iter_sampling = 1e4)
 
 # 4.2.3 Model checks ####
 # check Rhat, effective sample size and chains
-experimental_blank_summary <- experimental_blank_samples %>%
-  map(~ .x$summary())
+experimental_blank_summary <- experimental_blank_samples$summary()
 
 experimental_blank_summary %>%
-  bind_rows() %>%
   filter(rhat > 1.001)
 # no Rhat above 1.001
 
 experimental_blank_summary %>%
-  bind_rows() %>%
   summarise(rhat_mean = mean(rhat),
             rhat_sd = sd(rhat),
             ess_mean = mean(ess_bulk),
             ess_sd = sd(ess_bulk))
 # great Rhat and effective sample size
 
-experimental_blank_draws <- experimental_blank_samples %>%
-  map(~ .x$draws(format = "df"))
+experimental_blank_draws <- experimental_blank_samples$draws(format = "df")
 
-ggsave(
 experimental_blank_draws %>%
-  map(~ mcmc_rank_overlay(.x)) %>%
-  wrap_plots() +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "top"),
-filename = "blank_rank.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
+  mcmc_rank_overlay()
 # chains look good
 
 # 4.2.4 Prior-posterior comparison ####
-experimental_blank_prior_posterior <- experimental_blank_samples %>%
-  map(~ spread_draws(.x, Fmu, sigma) %>%
-        ungroup() %>%
-        mutate(
-          sigma_prior = rexp(length(.draw), 1),
-          Fmu_prior = rgamma(length(.draw), 150^2 / 50^2, 150 / 50^2)
-        )
-  )
+experimental_blank_posterior <- experimental_blank_samples %>%
+  recover_types(experimental %>% 
+                  imap(~ .x$blank %>%
+                         mutate(Group = .y %>% fct())) %>% 
+                  bind_rows() %>%
+                  select(Fluorescence, Group) %>%
+                  compose_data()) %>%
+  gather_draws(Fmu[Group], Fmu_mu, Fmu_sigma, sigma) %>%
+  ungroup()
 
-str(experimental_blank_prior_posterior)
+str(experimental_blank_posterior)
 
 ggsave(
-experimental_blank_prior_posterior %>%
-  map(~ pivot_longer(., cols = c("Fmu", "Fmu_prior", "sigma", "sigma_prior"),
-                     names_to = c("Parameter", "Distribution"),
-                     names_sep = "_", # this will produce NAs and throw a warning message
-                     values_to = "Samples") %>%
+experimental_blank_posterior %>%
+  mutate(Distribution = "Posterior") %>%
+  bind_rows(
+  tibble(
+    Fmu_sigma__prior = rexp(length(.draw), 1),
+         sigma__prior = rexp(length(.draw), 1),
+         Fmu__prior = rnorm(length(.draw), log(200) , 1),
+         Fmu_mu__prior = rnorm(length(.draw), log(200) , 1))
+  ) %>%
+  pivot_longer(cols = -c(".chain", ".iteration", ".draw", "Group"),
+               names_to = c("Parameter", "Distribution"),
+               names_sep = "__", # this will produce NAs and throw a warning message
+               values_to = "Samples") %>%
         mutate(Parameter = fct(Parameter),
                Distribution = fct(ifelse(is.na(Distribution), # here the NAs are dealt with
                                          "posterior", Distribution))) %>%
         ggplot(aes(Samples, fill = Distribution)) +
-        facet_wrap(~ Parameter, scales = "free", nrow = 1) +
-        geom_density(colour = NA, alpha = 0.5) +
-        theme_minimal() +
-        theme(legend.position = "top", legend.justification = 0)) %>%
-  wrap_plots() +
-  plot_layout(guides = "collect") &
-  theme(legend.position = "top"),
-filename = "blank_prior_posterior.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
+          facet_grid(Group ~ Parameter, scales = "free") +
+          geom_density(colour = NA, alpha = 0.5) +
+          theme_minimal() +
+          theme(legend.position = "top", legend.justification = 0),
+filename = "blank_prior_posterior.pdf", width = 40, height = 80, unit = "cm", device = cairo_pdf)
 # priors are not restrictive
 
 # 4.2.5 Predictions for mu ####
 experimental_blank_mu <- experimental_blank_prior_posterior %>%
-  map(~ .x %>% select(.chain, .iteration, .draw, Fmu))
+  select(-ends_with("prior")) %>%
+  mutate(Fmu = exp(Fmu),
+         Fmu_unobserved = exp( rnorm(n(), )))
+  
 
 # 4.3 Control models ####
 # To correctly calculate enzyme activities of experimental samples, a substrate autogenic
