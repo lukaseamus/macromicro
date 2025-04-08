@@ -2,14 +2,17 @@
 # Load output from BMG CLARIOstar Plus microplate reader
 require(tidyverse)
 require(here)
-files <- list.files(path = here("Microbes", "Raw"), pattern = "\\.csv$", full.names = TRUE)
+files <- here("Microbes", "Raw") %>% list.files(pattern = "\\.csv$", full.names = TRUE)
 
 enzyme <- files %>%
   map(~ read.csv(., skip = 9, header = TRUE) %>%
         rename(Fluorescence = "Raw.Data..360.20.450.30.") %>%
-        mutate(Fluorescence = as.numeric(Fluorescence))) %>%
+        mutate(Fluorescence = Fluorescence %>% as.numeric(),
+               Well = Well %>% fct(),
+               Content = Content %>% fct())) %>%
   set_names(str_remove(basename(files), "\\..*$") %>% make.names) %>%
-  imap(~ .x %>% mutate(Date = str_extract(.y, "\\d+(?=enzyme)") %>% dmy()))
+  imap(~ .x %>% mutate(Date = str_extract(.y, "\\d+(?=enzyme)") %>% dmy(),
+                       Plate2 = str_remove(.y, "^X") %>% fct()))
 
 str(enzyme)
 
@@ -20,8 +23,8 @@ meta <- here("Microbes", "Meta.csv") %>% read.csv()
 require(magrittr)
 enzyme %<>% 
   imap(~ bind_cols(.x, meta %>% filter(Plate == str_remove(.y, "^X"))) %>%
-         mutate(Date2 = str_extract(Plate, "\\d+(?=enzyme)") %>% dmy()))
-
+         mutate(Date2 = str_extract(Plate, "\\d+(?=enzyme)") %>% dmy(),
+                Plate = Plate %>% fct()))
 str(enzyme)
 
 # Cross-validate that join worked correctly
@@ -35,11 +38,14 @@ enzyme %>%
 # or
 enzyme %>% 
   map(~ .x %$% identical(Date, Date2))
+# or
+enzyme %>% 
+  map(~ .x %$% identical(Plate, Plate2))
 
 # remove additional Date variable and change Plate to number
 enzyme %<>% 
-  map(~ .x %>% select(-Date2) %>%
-        mutate(Plate = str_extract(Plate, "\\d+(?=[^\\d]*$)") %>%
+  map(~ .x %>% select(-c(Date2, Plate2)) %>%
+        mutate(Plate_number = str_extract(Plate, "\\d+(?=[^\\d]*$)") %>%
                  as.numeric()))
 str(enzyme)
 
@@ -694,12 +700,12 @@ enzyme$X031121enzyme9 %>%
 # 2. The water reference can be either MilliQ or autoclaved seawater
 # 3. The substrate control can be either MilliQ or autoclaved seawater
 
-rm(list = setdiff(ls(), c("enzyme", "meta")))
+rm(list = setdiff(ls(), c("enzyme", "meta", "beta", "F0", "Fmax")))
 
 # 4. Experimental samples ####
 experimental <- enzyme %>%
   map(~ .x %>% filter(Date >= "281021" %>% dmy() & 
-                        !(Date == "031121" %>% dmy() & Plate == 9))) %>%
+                        !(Date == "031121" %>% dmy() & Plate_number == 9))) %>%
   keep(~ nrow(.x) > 0)
 
 # Split each dataframe in experimental into its components
@@ -733,7 +739,8 @@ experimental %>%
           theme(panel.grid = element_blank())
   ) %>%
   wrap_plots() %>% # too large to view in RStudio
-  ggsave(filename = "Plots/standard_data.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
+  ggsave(filename = "standard_data.pdf", path = here("Plots"),
+         width = 80, height = 40, unit = "cm", device = cairo_pdf)
 
 # 4.1.1 Prior simulation ####
 experimental_standard_prior <-
@@ -821,14 +828,16 @@ ggsave( # too large to view in RStudio
     wrap_plots() +
     plot_layout(guides = "collect") &
     theme(legend.position = "top"),
-  filename = "Plots/standard_rank.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
+  filename = "standard_rank.pdf", path = here("Plots"),
+  width = 80, height = 40, unit = "cm", device = cairo_pdf)
 # chains look good
 
 experimental_standard_samples %>%
   map(~ .x$draws(format = "df") %>%
         mcmc_pairs(pars = c("Fmax", "beta", "F0"))) %>%
   wrap_plots() %>%
-  ggsave(filename = "Plots/standard_pairs.pdf", width = 80, height = 80, unit = "cm", device = cairo_pdf)
+  ggsave(filename = "standard_pairs.pdf", path = here("Plots"),
+         width = 80, height = 80, unit = "cm", device = cairo_pdf)
 # some correlation between Fmax and beta, indicating some interdependence
 
 # 4.1.4 Prior-posterior comparison ####
@@ -854,22 +863,22 @@ ggsave(
     wrap_plots() +
     plot_layout(guides = "collect") &
     theme(legend.position = "top"),
-  filename = "Plots/standard_prior_posterior.pdf", width = 80, height = 40,
-  unit = "cm", device = cairo_pdf)
+  filename = "standard_prior_posterior.pdf", path = here("Plots"),
+  width = 80, height = 40, unit = "cm", device = cairo_pdf)
 # F0 broke out quite a bit, so the model predicts higher intercepts than expected
 
 # 4.1.5 Predictions ####
-experimental_standard_prior_posterior <- experimental_standard_prior %>%
+experimental_standard_predictions <- experimental_standard_prior %>%
   map2(experimental_standard_samples,
        ~ prior_posterior_draws(prior_samples = .x,
                                posterior_samples = .y,
                                group = list(NA),
                                parameters = c("Fmax", "beta", "F0", "sigma"),
-                               format = "short"))
-
-experimental_standard_predictions <- experimental_standard_prior_posterior %>%
-  map2(experimental, ~ spread_continuous(.x, .y$standard, predictor_name = "Concentration",
-                                         length = 50)) %>%
+                               format = "short")) %>%
+  map2(experimental, 
+       ~ spread_continuous(.x, .y$standard, 
+                           predictor_name = "Concentration",
+                           length = 50)) %>%
   map(~ .x %>% mutate(mu = Fmax * beta * Concentration / ( Fmax + beta * Concentration ) + F0,
                       obs = rnorm(n(), mu, sigma)))
 
@@ -901,8 +910,8 @@ experimental_standard_predictions_summary %>%
        ) %>%
   imap(~ .x + ggtitle(.y)) %>%
   wrap_plots() %>%
-  ggsave(filename = "Plots/standard_predictions.pdf", width = 80, height = 40,
-         unit = "cm", device = cairo_pdf)
+  ggsave(filename = "standard_predictions.pdf", path = here("Plots"),
+         width = 80, height = 40, unit = "cm", device = cairo_pdf)
 # great fit except for those deviations in F0
 
 # 4.2 Blank models ####
@@ -913,22 +922,25 @@ experimental_standard_predictions_summary %>%
 
 # Visualise
 experimental %>%
-  map(~ .x$blank %>%
+  imap(~ .x$blank %>%
         ggplot(aes(Well, Fluorescence)) +
           geom_point(size = 3, shape = 16) +
           geom_hline(data = . %>% summarise(Fluorescence = median(Fluorescence)),
                      aes(yintercept = Fluorescence)) +
-          theme_minimal()
+          theme_minimal() +
+          ggtitle(.y)
   ) %>%
   wrap_plots() %>% # too large to view in RStudio
-  ggsave(filename = "Plots/blank_data.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
-# There are four plates missing blanks, which will have to be substituted with an average.
+  ggsave(filename = "blank_data.pdf", path = here("Plots"),
+         width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# There are four plates missing blanks, which will have to be substituted with an average:
+# X281021enzyme1, X281021enzyme3, X281021enzyme5, and X281021enzyme7.
 # This is best done with hierarchical modelling, which requires that the data be combined.
 # Also data are clearly right-skewed due to their non-negative nature, so a gamma likelihood is best.
 
 # 4.2.1 Prior simulation ####
 # Water autofluorescence is around 200 arbitrary units relative to maximal 100 µM standard fluorescence.
-# Since fluorescence cannot be negative, a gamma distribution is best as the likelihood. To properly 
+# Since fluorescence cannot be negative, a gamma distribution is best as the likelihood. To properly
 # simulate the outcome we need to transform the normal parameter distribution by exponentiating. While
 # the mean can simply be said to the logarithm of the expected mean, the sd must be simulated.
 
@@ -948,15 +960,15 @@ experimental_blank_stan <- "
 data{
   int n;
   vector<lower=0>[n] Fluorescence;
-  array[n] int Group;
-  int n_Group;
+  array[n] int Plate;
+  int n_Plate;
 }
 
 parameters{
   real Fmu_mu; // Hyperparameters
   real<lower=0> Fmu_sigma;
 
-  vector[n_Group] Fmu;
+  vector[n_Plate] Fmu;
 
   real<lower=0> sigma;
 }
@@ -966,7 +978,7 @@ model{
   Fmu_mu ~ normal( log(200) , 1 );
   Fmu_sigma ~ exponential( 1 );
 
-  // Group-level prior
+  // Plate-level prior
   Fmu ~ normal( Fmu_mu , Fmu_sigma );
 
   sigma ~ exponential( 1 );
@@ -974,7 +986,7 @@ model{
   // Model
   vector[n] mu;
   for ( i in 1:n ) {
-    mu[i] = exp( Fmu[Group[i]] ); // Exponential transformation
+    mu[i] = exp( Fmu[Plate[i]] ); // Exponential transformation
   }
 
   // Gamma likelihood (generalsied linear model)
@@ -988,11 +1000,10 @@ experimental_blank_mod <- experimental_blank_stan %>%
 
 experimental_blank_samples <- experimental_blank_mod$sample(
   data = experimental %>%
-    imap(~ .x$blank %>% # here I am creating the unique plate grouping variable
-          mutate(Group = .y %>% fct())) %>%
-    keep(~ nrow(.x) > 0) %>% # drop all list items without data
+    map(~ .x$blank) %>% # select only blank subset
+    keep(~ nrow(.x) > 0) %>% # drop all list items (plates) without data
     bind_rows() %>% # here I am combining the blank dataframes to compare across plates
-    select(Fluorescence, Group) %>%
+    select(Fluorescence, Plate) %>%
     compose_data(),
   chains = 8,
   parallel_chains = parallel::detectCores(),
@@ -1020,11 +1031,10 @@ experimental_blank_samples$draws(format = "df") %>%
 experimental_blank_prior <- prior_samples(
   model = experimental_blank_mod,
   data = experimental %>%
-    imap(~ .x$blank %>%
-           mutate(Group = .y %>% fct())) %>%
+    map(~ .x$blank) %>%
     keep(~ nrow(.x) > 0) %>%
     bind_rows() %>%
-    select(Fluorescence, Group) %>%
+    select(Fluorescence, Plate) %>%
     compose_data(),
   chains = 8, samples = 1e4)
 # prior_samples() doesn't fully support multilevel models but
@@ -1034,14 +1044,13 @@ experimental_blank_prior <- prior_samples(
 experimental_blank_prior %>%
     prior_posterior_draws(posterior_samples = experimental_blank_samples,
                           group = experimental %>%
-                            imap(~ .x$blank %>%
-                                   mutate(Group = .y %>% fct())) %>%
+                            map(~ .x$blank) %>%
                             keep(~ nrow(.x) > 0) %>%
                             bind_rows() %>%
-                            select(Group),
-                          parameters = c("Fmu[Group]", "Fmu_mu", "Fmu_sigma", "sigma"),
+                            select(Plate),
+                          parameters = c("Fmu[Plate]", "Fmu_mu", "Fmu_sigma", "sigma"),
                           format = "long") %>%
-  prior_posterior_plot(group_name = "Group")
+  prior_posterior_plot(group_name = "Plate")
 # Note the fuzziness of the prior. Stan doesn't seem to be able to smoothly estimate
 # hierarchical priors.
 # For smooth prior distributions, generate in R:
@@ -1056,45 +1065,43 @@ experimental_blank_prior <-
          sigma = rexp(8 * 1e4, 1)) %>%
   pivot_longer(cols = -starts_with("."),
                names_to = ".variable", values_to = ".value") %>%
-  mutate(rep = if_else(.variable == "Fmu", 24, 1),
+  mutate(rep = if_else(.variable == "Fmu", 24, 1), # there are 24 plates
          .variable = fct_relevel(.variable, "Fmu")) %>%
   uncount(rep) %>%
   arrange(.variable) %>%
-  mutate(Group = experimental %>%
-           imap(~ .x$blank %>%
-                  mutate(Group = .y %>% fct())) %>%
+  mutate(Plate = experimental %>%
+           map(~ .x$blank) %>%
            keep(~ nrow(.x) > 0) %>%
-           bind_rows() %$% levels(Group) %>%
+           bind_rows() %$% levels(Plate) %>%
            rep(8 * 1e4) %>%
            c(NA %>% rep(3 * 8 * 1e4)))
 
 experimental_blank_posterior <-
   experimental_blank_samples %>%
   recover_types(experimental %>%
-                  imap(~ .x$blank %>%
-                         mutate(Group = .y %>% fct())) %>%
+                  map(~ .x$blank) %>%
                   keep(~ nrow(.x) > 0) %>%
-                  bind_rows() %>% select(Group)) %>%
-  gather_draws(Fmu[Group], Fmu_mu, Fmu_sigma, sigma) %>%
+                  bind_rows() %>%
+                  select(Plate)) %>%
+  gather_draws(Fmu[Plate], Fmu_mu, Fmu_sigma, sigma) %>%
   ungroup()
-
 
 experimental_blank_prior %>%
   mutate(distribution = "prior") %>%
   bind_rows(experimental_blank_posterior %>%
               mutate(distribution = "posterior")) %>%
-  prior_posterior_plot(group_name = "Group")
+  prior_posterior_plot(group_name = "Plate")
 # Not fuzzy. Everything fine.
 
 # 4.2.5 Predictions ####
 experimental_blank_predictions <-
   experimental_blank_samples %>%
   recover_types(experimental %>%
-                  imap(~ .x$blank %>%
-                         mutate(Group = .y %>% fct())) %>%
+                  map(~ .x$blank) %>%
                   keep(~ nrow(.x) > 0) %>%
-                  bind_rows() %>% select(Group)) %>%
-  spread_draws(Fmu[Group], sigma) %>%
+                  bind_rows() %>%
+                  select(Plate)) %>%
+  spread_draws(Fmu[Plate], sigma) %>%
   mutate(Fmu = exp(Fmu),
          obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
   select(-sigma) %>%
@@ -1102,8 +1109,7 @@ experimental_blank_predictions <-
     experimental_blank_samples %>%
       spread_draws(Fmu_mu, Fmu_sigma, sigma) %>%
       mutate(Fmu = exp( rnorm(n(), Fmu_mu, Fmu_sigma) ),
-             obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2),
-             Group = "unobserved") %>%
+             obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
       select(-c(Fmu_mu, Fmu_sigma, sigma))
   ) %>%
   pivot_longer(cols = c("Fmu", "obs"),
@@ -1114,7 +1120,7 @@ experimental_blank_predictions %>%
     geom_density(colour = NA, fill = "black") +
     scale_x_continuous(limits = c(0, 500), oob = scales::oob_keep) +
     scale_alpha_manual(values = c(0.6, 0.2)) +
-    facet_wrap(~ Group, scales = "free") +
+    facet_wrap(~ Plate, scales = "free") +
     theme_minimal() +
     theme(panel.grid = element_blank())
 # It makes most sense to me to use Fmu here rather than predicted observations,
@@ -1125,7 +1131,7 @@ experimental_blank_predictions %>%
   ggplot(aes(Fluorescence)) +
     geom_density(colour = NA, fill = "black") +
     scale_x_continuous(limits = c(0, 500), oob = scales::oob_keep) +
-    facet_wrap(~ Group, scales = "free") +
+    facet_wrap(~ Plate, scales = "free") +
     theme_minimal() +
     theme(panel.grid = element_blank())
 
@@ -1144,30 +1150,13 @@ experimental %>%
           geom_point(size = 3, shape = 16) +
           geom_hline(data = . %>% summarise(Fluorescence = median(Fluorescence)),
                      aes(yintercept = Fluorescence)) +
-          ggtitle(.y) +
-          theme_minimal()
+          theme_minimal() +
+          ggtitle(.y)
   ) %>%
   wrap_plots() %>%
-  ggsave(filename = "Plots/control_data.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
-# unlike for the blanks, the control data are complete, but there are some outliers that
-# are clearly contamination and need removing, e.g. Wells F07 and F08 in Plate X281021enzyme7
-# plot without outliers
-ggsave(
-experimental %>%
-  imap(~ .x$control %>%
-         mutate(Group = .y %>% fct())) %>%
-  bind_rows() %>%
-  filter(!(Well %in% c("F07", "F08") & Group == "X281021enzyme7") &
-         !(Well %in% c("G10", "G11", "G12") & Group == "X101221enzyme") &
-         !(Well == "H08" & Group == "X091121enzyme4")) %>%
-        ggplot(aes(Well, Fluorescence)) +
-          geom_point(size = 3, shape = 16) +
-          geom_hline(data = . %>% group_by(Group) %>% 
-                       summarise(Fluorescence = median(Fluorescence)),
-                     aes(yintercept = Fluorescence)) +
-          facet_wrap(~ Group, scales = "free") +
-          theme_minimal(),
-filename = "Plots/control_data_nooutliers.pdf", width = 80, height = 40, unit = "cm", device = cairo_pdf)
+  ggsave(filename = "control_data.pdf", path = here("Plots"),
+         width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# unlike for the blanks, the control data are complete
 
 # 4.3.1 Prior simulation ####
 # Substrate autofluorescence is on average 500 arbitrary units relative to maximal 100 µM standard fluorescence.
@@ -1176,36 +1165,53 @@ filename = "Plots/control_data_nooutliers.pdf", width = 80, height = 40, unit = 
 # hierarchical model is necessary.
 
 ggplot() +
-  geom_density(aes(rnorm(1e5, log(200), 1) %>% exp())) +
+  geom_density(aes(rnorm(1e5, log(500), 1) %>% exp())) +
   # scale_x_continuous(limits = c(0, 2e3), oob = scales::oob_keep) + # unhash to zoom in on peak
   theme_minimal()
 # lots of variability
 
 # here is the underlying distribution
 ggplot() +
-  geom_density(aes(rnorm(1e5, log(200), 1))) +
+  geom_density(aes(rnorm(1e5, log(500), 1))) +
   theme_minimal()
+
+# Additionally, via reparameterisation of the gamma likelihood in terms of mean (mu) and scale (theta),
+# gamma( mu / theta, 1 / theta), I discovered that exponential(1) is too restrictive a prior on the 
+# likelihood uncertainty. It worked with mean and scale, but not with mean and sd (sigma). 
+# I kept my parameterisation but changed the prior to exponential(0.01).
 
 # 4.3.2 Run model ####
 experimental_control_stan <- "
 data{
   int n;
   vector<lower=0>[n] Fluorescence;
+  array[n] int Plate;
+  int n_Plate;
 }
 
 parameters{
-  real Fmu;
+  real Fmu_mu; // Hyperparameters
+  real<lower=0> Fmu_sigma;
+
+  vector[n_Plate] Fmu;
+
   real<lower=0> sigma;
 }
 
 model{
-  Fmu ~ normal( log(200) , 2 );
-  sigma ~ exponential( 1 );
+  // Hyperpriors
+  Fmu_mu ~ normal( log(500) , 1 );
+  Fmu_sigma ~ exponential( 1 );
+
+  // Plate-level prior
+  Fmu ~ normal( Fmu_mu , Fmu_sigma );
+
+  sigma ~ exponential( 0.01 );
 
   // Model
   vector[n] mu;
   for ( i in 1:n ) {
-    mu[i] = exp( Fmu ); // Exponential transformation
+    mu[i] = exp( Fmu[Plate[i]] ); // Exponential transformation
   }
 
   // Gamma likelihood (generalsied linear model)
@@ -1213,120 +1219,23 @@ model{
 }
 "
 
-experimental_control_stan <- "
-data{
-  int n;
-  vector<lower=0>[n] Fluorescence;
-}
-
-parameters{
-  real Fmu;
-  real<lower=0> sigma;
-}
-
-model{
-  Fmu ~ normal( 500 , 100 );
-  sigma ~ exponential( 1 );
-
-  // Model
-  vector[n] mu;
-  for ( i in 1:n ) {
-    mu[i] = Fmu;
-  }
-
-  // Normal likelihood
-  Fluorescence ~ normal( mu , sigma );
-}
-"
-
 experimental_control_mod <- experimental_control_stan %>%
   write_stan_file() %>%
   cmdstan_model()
 
-experimental_control_samples <- experimental %>%
-  map(~ experimental_control_mod$sample(data = .x$control %>%
-                                          select(Fluorescence) %>%
-                                          compose_data(),
-                                        chains = 8,
-                                        parallel_chains = parallel::detectCores(),
-                                        iter_warmup = 1e4,
-                                        iter_sampling = 1e4)
-      )
+experimental_control_samples <- experimental_control_mod$sample(
+  data = experimental %>%
+    map(~ .x$control) %>% # select only control subset
+    bind_rows() %>%
+    select(Fluorescence, Plate) %>%
+    compose_data(),
+  chains = 8,
+  parallel_chains = parallel::detectCores(),
+  iter_warmup = 1e4,
+  iter_sampling = 1e4)
 
 # 4.3.3 Model checks ####
 # check Rhat, effective sample size and chains
-experimental_control_samples %>%
-  map(~ .x$summary()) %>%
-  bind_rows() %>%
-  mutate(rhat_check = rhat > 1.001) %>%
-  summarise(rhat_1.001 = sum(rhat_check) / length(rhat),
-            rhat_mean = mean(rhat),
-            rhat_sd = sd(rhat),
-            ess_mean = mean(ess_bulk),
-            ess_sd = sd(ess_bulk))
-# no rhat above 1.001
-# good effective sample size
-
-ggsave(
-  experimental_control_samples %>%
-    map(~ .x$draws(format = "df") %>%
-          mcmc_rank_overlay()) %>%
-    wrap_plots() +
-    plot_layout(guides = "collect") &
-    theme(legend.position = "top"),
-  filename = "Plots/control_rank.pdf", width = 80, height = 40, 
-  unit = "cm", device = cairo_pdf)
-# chains look good
-
-# 4.3.4 Prior-posterior comparison ####
-# sample prior
-experimental_control_prior <- experimental %>%
-  map(~ prior_samples(model = experimental_control_mod,
-                      data = .x$control %>%
-                        select(Fluorescence) %>%
-                        compose_data(),
-                      chains = 8, samples = 1e4))
-
-# plot prior-posterior comparison
-ggsave(
-  experimental_control_prior %>%
-    map2(experimental_control_samples,
-         ~ prior_posterior_draws(prior_samples = .x,
-                                 posterior_samples = .y,
-                                 group = list(NA),
-                                 parameters = c("Fmu", "sigma"),
-                                 format = "long")
-         # %>% mutate(.value = if_else(.variable == "Fmu", exp(.value), .value))
-         ) %>%
-    imap(~ .x %>% prior_posterior_plot() + 
-           # scale_x_continuous(limits = c(0, 200), oob = scales::oob_keep) + 
-           ggtitle(.y)) %>%
-    wrap_plots() +
-    plot_layout(guides = "collect") &
-    theme(legend.position = "top"),
-  filename = "Plots/control_prior_posterior.pdf", width = 80, height = 40,
-  unit = "cm", device = cairo_pdf)
-
-
-
-
-
-####################
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 experimental_control_samples$summary() %>%
   mutate(rhat_check = rhat > 1.001) %>%
   summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
@@ -1346,10 +1255,9 @@ experimental_control_samples$draws(format = "df") %>%
 experimental_control_prior <- prior_samples(
   model = experimental_control_mod,
   data = experimental %>%
-    imap(~ .x$control %>%
-           mutate(Group = .y %>% fct())) %>%
+    map(~ .x$control) %>%
     bind_rows() %>%
-    select(Fluorescence, Group) %>%
+    select(Fluorescence, Plate) %>%
     compose_data(),
   chains = 8, samples = 1e4)
 
@@ -1357,106 +1265,308 @@ experimental_control_prior <- prior_samples(
 experimental_control_prior %>%
     prior_posterior_draws(posterior_samples = experimental_control_samples,
                           group = experimental %>%
-                            imap(~ .x$control %>%
-                                   mutate(Group = .y %>% fct())) %>%
+                            map(~ .x$control) %>%
                             bind_rows() %>%
-                            select(Group),
-                          parameters = c("Fmu[Group]", "sigma"),
+                            select(Plate),
+                          parameters = c("Fmu[Plate]", "Fmu_mu", "Fmu_sigma", "sigma"),
                           format = "long") %>%
-  prior_posterior_plot(group_name = "Group")
-# Note the fuzziness of the prior. Stan doesn't seem to be able to smoothly estimate
-# hierarchical priors.
-# For smooth prior distributions, generate in R:
+  prior_posterior_plot(group_name = "Plate")
 
-experimental_blank_prior <-
+# prior-posterior comparison in R
+experimental_control_prior <-
   tibble(.chain = 1:8 %>% rep(each = 1e4),
          .iteration = 1:1e4 %>% rep(8),
          .draw = 1:8e4,
-         Fmu_mu = rnorm(8 * 1e4, log(200) , 1),
+         Fmu_mu = rnorm(8 * 1e4, log(500) , 1),
          Fmu_sigma = rexp(8 * 1e4, 1),
          Fmu = rnorm(8 * 1e4, Fmu_mu, Fmu_sigma),
-         sigma = rexp(8 * 1e4, 1)) %>%
+         sigma = rexp(8 * 1e4, 0.1)) %>%
   pivot_longer(cols = -starts_with("."),
                names_to = ".variable", values_to = ".value") %>%
-  mutate(rep = if_else(.variable == "Fmu", 24, 1),
+  mutate(rep = if_else(.variable == "Fmu", 28, 1), # there are 28 plates
          .variable = fct_relevel(.variable, "Fmu")) %>%
   uncount(rep) %>%
   arrange(.variable) %>%
-  mutate(Group = experimental %>%
-           imap(~ .x$blank %>%
-                  mutate(Group = .y %>% fct())) %>%
-           keep(~ nrow(.x) > 0) %>%
-           bind_rows() %$% levels(Group) %>%
+  mutate(Plate = experimental %>%
+           map(~ .x$control) %>%
+           bind_rows()  %$% levels(Plate) %>%
            rep(8 * 1e4) %>%
            c(NA %>% rep(3 * 8 * 1e4)))
 
-experimental_blank_posterior <-
-  experimental_blank_samples %>%
+experimental_control_posterior <-
+  experimental_control_samples %>%
   recover_types(experimental %>%
-                  imap(~ .x$blank %>%
-                         mutate(Group = .y %>% fct())) %>%
-                  keep(~ nrow(.x) > 0) %>%
-                  bind_rows() %>% select(Group)) %>%
-  gather_draws(Fmu[Group], Fmu_mu, Fmu_sigma, sigma) %>%
+                  map(~ .x$control) %>%
+                  bind_rows() %>%
+                  select(Plate)) %>%
+  gather_draws(Fmu[Plate], Fmu_mu, Fmu_sigma, sigma) %>%
   ungroup()
 
-
-experimental_blank_prior %>%
+experimental_control_prior %>%
   mutate(distribution = "prior") %>%
-  bind_rows(experimental_blank_posterior %>%
+  bind_rows(experimental_control_posterior %>%
               mutate(distribution = "posterior")) %>%
-  prior_posterior_plot(group_name = "Group")
-# Not fuzzy. Everything fine.
+  prior_posterior_plot(group_name = "Plate")
 
-# 4.2.5 Predictions ####
-experimental_blank_predictions <-
-  experimental_blank_samples %>%
+# 4.3.5 Predictions ####
+experimental_control_predictions <-
+  experimental_control_samples %>%
   recover_types(experimental %>%
-                  imap(~ .x$blank %>%
-                         mutate(Group = .y %>% fct())) %>%
-                  keep(~ nrow(.x) > 0) %>%
-                  bind_rows() %>% select(Group)) %>%
-  spread_draws(Fmu[Group], sigma) %>%
+                  map(~ .x$control) %>%
+                  bind_rows() %>%
+                  select(Plate)) %>%
+  spread_draws(Fmu[Plate], sigma) %>%
   mutate(Fmu = exp(Fmu),
          obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
   select(-sigma) %>%
   bind_rows(
-    experimental_blank_samples %>%
+    experimental_control_samples %>%
       spread_draws(Fmu_mu, Fmu_sigma, sigma) %>%
       mutate(Fmu = exp( rnorm(n(), Fmu_mu, Fmu_sigma) ),
-             obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2),
-             Group = "unobserved") %>%
+             obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
       select(-c(Fmu_mu, Fmu_sigma, sigma))
   ) %>%
   pivot_longer(cols = c("Fmu", "obs"),
                names_to = "level", values_to = "Fluorescence")
 
-experimental_blank_predictions %>%
+experimental_control_predictions %>%
   ggplot(aes(Fluorescence, alpha = factor(level))) +
     geom_density(colour = NA, fill = "black") +
-    scale_x_continuous(limits = c(0, 500), oob = scales::oob_keep) +
+    scale_x_continuous(limits = c(0, 2e3), oob = scales::oob_keep) +
     scale_alpha_manual(values = c(0.6, 0.2)) +
-    facet_wrap(~ Group, scales = "free") +
+    facet_wrap(~ Plate, scales = "free") +
     theme_minimal() +
     theme(panel.grid = element_blank())
-# It makes most sense to me to use Fmu here rather than predicted observations,
-# since we are replacing F0. That is while we want Fmu on the response scale, it is
-# to substitute another parameter so does not need to pass through the likelihood.
-experimental_blank_predictions %>%
+# It makes most sense to me to use Fmu since that is what I used for the water blank.
+experimental_control_predictions %>%
   filter(level == "Fmu") %>%
   ggplot(aes(Fluorescence)) +
     geom_density(colour = NA, fill = "black") +
-    scale_x_continuous(limits = c(0, 500), oob = scales::oob_keep) +
-    facet_wrap(~ Group, scales = "free") +
+    scale_x_continuous(limits = c(0, 1.2e3), oob = scales::oob_keep) +
+    facet_wrap(~ Plate, scales = "free") +
     theme_minimal() +
     theme(panel.grid = element_blank())
 
-# 4.4 Convert sample fluorescence ####
+rm(list = setdiff(ls(), c("enzyme", "meta", "experimental", "experimental_standard_samples", 
+                          "experimental_blank_samples", "experimental_standard_samples", 
+                          "experimental_blank_predictions", "experimental_control_predictions")))
+
+# 4.4 Conversion ####
+# solving F = Fmax * beta * c / ( Fmax + beta * c ) + F0 for c
+# gives c = Fmax * ( F - F0 ) / ( beta * ( F0 + Fmax - F ) )
+
+# 4.4.1 Combine posteriors ####
+experimental_standard <- experimental_standard_samples %>%
+  imap(~ .x %>% spread_draws(Fmax, beta, F0) %>%
+         mutate(Plate = str_remove(.y, "^X") %>% fct())) %>%
+  bind_rows()
+
+experimental_blank <- experimental_blank_predictions %>%
+  filter(!is.na(Plate)) %>% # filter out predictions for unobserved plates
+  bind_rows(
+    experimental_blank_predictions %>%
+      filter(is.na(Plate)) %>% # replicate prediction for unobserved plates
+      slice(rep(1:n(), each = 4)) %>% # and allocate unobserved plate names
+      mutate(Plate = c("281021enzyme1", "281021enzyme3",
+                       "281021enzyme5", "281021enzyme7") %>%
+               rep(length.out = n()) %>% fct())
+  ) %>%
+  filter(level == "Fmu") %>%
+  select(-level) %>%
+  rename(blank = Fluorescence)
+  
+experimental_control <- experimental_control_predictions %>%
+  filter(!is.na(Plate) & level == "Fmu") %>% # filter out predictions for unobserved plates
+  select(-level) %>% # (no predictions for unobserved plates to be made here)
+  rename(control = Fluorescence)
+
+experimental_parameters <- experimental_standard %>%
+  full_join(experimental_blank,
+            by = c("Plate", ".chain", ".iteration", ".draw")) %>%
+  full_join(experimental_control,
+            by = c("Plate", ".chain", ".iteration", ".draw"))
+
+# # Here's how to do the opposite: turn a grouped tibble into a named list
+# experimental_blank_predictions %>%
+#   filter(level == "Fmu") %>%
+#   select(-level) %>%
+#   rename(blank = Fluorescence) %>%
+#   group_by(Group) %>%
+#   group_split() %>%
+#   set_names(
+#     map(., ~ .x$Group[1])
+#   ) %>%
+#   map(~ .x %>% select(-Group))
+# # But this enables less control over calculations that require group matching
+
+# 4.4.2 Convert sample fluorescence ####
+experimental_samples <- experimental %>%
+  map(~ .x$samples) %>% # select samples
+  bind_rows() %>% # convert list to tibble
+  rename(ID = Annotation) %>%
+  full_join(experimental_parameters,
+            by = "Plate",
+            relationship = "many-to-many") %>%
+  mutate(# replace F0 with blank and convert sample and control fluorescence to enzyme activity
+         Activity_raw = ( Fmax * ( Fluorescence - blank ) / ( beta * ( blank + Fmax - Fluorescence ) ) ),
+         Activity_control = ( Fmax * ( control - blank ) / ( beta * ( blank + Fmax - control ) ) ),
+         # correct sample enzyme activity by subtracting the converted control
+         Activity = Activity_raw - Activity_control,
+         ID = ID %>% fct())
+
+str(experimental_samples)
+
+# 4.5 Standardisation ####
+# 4.5.1 Load area and mass data ####
+area <- here("Microbes", "Disc_Area.csv") %>% read.csv() %>%
+  mutate(Species = Species %>% fct())
+# Disc area (cm^2) was measured for a few random replicates of each species.
+area %>% 
+  ggplot(aes(Species, Area)) +
+    geom_hline(yintercept = area %$% mean(Area)) +
+    geom_point(shape = 16, alpha = 0.2, size = 3) +
+    geom_point(data = . %>% group_by(Species) %>% 
+                 summarise(Area = mean(Area)),
+               aes(Species, Area), size = 5, shape = 21, fill = NA) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+mass <- here("Microbes", "Disc_Mass.csv") %>% read.csv() %>%
+  mutate(Species = Species %>% fct(),
+         ID = ID %>% fct(),
+         Date = Date %>% dmy())
+# Disc mass (g) was measured for each disc that underwent the enzyme assay.
+mass %>% 
+  filter(Species != "Sediment") %>% # filter out heavy sediment for clarity
+  ggplot(aes(Species, Mass)) +
+    geom_hline(yintercept = mass %>% filter(Species != "Sediment") %$% mean(Mass)) +
+    geom_point(shape = 16, alpha = 0.2, size = 3) +
+    geom_point(data = . %>% 
+                 filter(Species != "Sediment") %>%
+                 group_by(Species) %>% 
+                 summarise(Mass = mean(Mass)),
+               aes(Species, Mass), size = 5, shape = 21, fill = NA) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+
+# 4.5.2 Match mass ####
+# Extracellular enzyme activity can either be reported per cm^2 or per g. I will have a look at both.
+# Because disc area was not measured for each disc, it needs to be approximated by modelling. Disc mass
+# on the other hand can directly be included in the calculation.
+
+experimental_samples %<>%
+  left_join(mass %>%
+              rename(Date_weighed = Date), 
+            by = "ID")
+
+# 4.5.2 Model area ####
+# The grand mean seems to be close to 0.55 cm^2.
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(0.55), 0.2) %>% exp())) +
+  theme_minimal()
+# lots of variability
+
+# here is the underlying distribution
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(0.55), 0.2))) +
+  theme_minimal()
+
+# Run model
+area_stan <- "
+data{
+  int n;
+  vector<lower=0>[n] Area;
+  array[n] int Species;
+  int n_Species;
+}
+
+parameters{
+  real Amu_mu; // Hyperparameters
+  real<lower=0> Amu_sigma;
+
+  vector[n_Species] Amu;
+
+  real<lower=0> sigma;
+}
+
+model{
+  // Hyperpriors
+  Amu_mu ~ normal( log(0.55) , 0.2 );
+  Amu_sigma ~ exponential( 1 );
+
+  // Plate-level prior
+  Amu ~ normal( Amu_mu , Amu_sigma );
+
+  sigma ~ exponential( 1 );
+
+  // Model
+  vector[n] mu;
+  for ( i in 1:n ) {
+    mu[i] = exp( Amu[Species[i]] ); // Exponential transformation
+  }
+
+  // Gamma likelihood (generalsied linear model)
+  Area ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+}
+"
+
+area_mod <- area_stan %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+area_samples <- area_mod$sample(
+  data = area %>%
+    select(Area, Species) %>%
+    compose_data(),
+  chains = 8,
+  parallel_chains = parallel::detectCores(),
+  iter_warmup = 1e4,
+  iter_sampling = 1e4)
+
+# check Rhat, effective sample size and chains
+area_samples$summary() %>%
+  mutate(rhat_check = rhat > 1.001) %>%
+  summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat),
+            ess_mean = mean(ess_bulk),
+            ess_sd = sd(ess_bulk))
+# no rhat above 1.001
+# good effective sample size
+
+area_samples$draws(format = "df") %>%
+  mcmc_rank_overlay()
+# chains look good
+
+# sample prior
+source("functions.R")
+area_prior <- prior_samples(
+  model = area_mod,
+  data = area %>%
+    select(Area, Species) %>%
+    compose_data(),
+  chains = 8, samples = 1e4)
+
+# plot prior-posterior comparison
+area_prior %>%
+    prior_posterior_draws(posterior_samples = area_samples,
+                          group = area %>% select(Species),
+                          parameters = c("Amu[Species]", "Amu_mu", "Amu_sigma", "sigma"),
+                          format = "long") %>%
+  prior_posterior_plot(group_name = "Species")
+# priors are fine
+
+area_predictions
+
+##########################################
 
 
+# 5. Grazing experiment ####
 
 
+# 6. Decomposition experiment ####
 
 
+# 7. Remaining samples ####
 
 

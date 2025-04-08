@@ -48,6 +48,9 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 
+# RData
+.RDataTmp1
+
 # macOS specific
 .DS_store
 
