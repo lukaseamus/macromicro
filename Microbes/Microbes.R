@@ -1459,7 +1459,7 @@ experimental_samples %<>%
               rename(Date_weighed = Date), 
             by = "ID")
 
-# 4.5.2 Model area ####
+# 4.5.3 Model area ####
 # The grand mean seems to be close to 0.55 cm^2.
 ggplot() +
   geom_density(aes(rnorm(1e5, log(0.55), 0.2) %>% exp())) +
@@ -1556,12 +1556,214 @@ area_prior %>%
   prior_posterior_plot(group_name = "Species")
 # priors are fine
 
-area_predictions
+# make predictions
+area_predictions <-
+  area_samples %>%
+  recover_types(area %>% select(Species)) %>%
+  spread_draws(Amu[Species], sigma) %>%
+  mutate(Amu = exp(Amu),
+         obs = rgamma(n(), Amu^2 / sigma^2, Amu / sigma^2)) %>%
+  select(-sigma) %>%
+  bind_rows(
+    area_samples %>%
+      spread_draws(Amu_mu, Amu_sigma, sigma) %>%
+      mutate(Amu = exp( rnorm(n(), Amu_mu, Amu_sigma) ),
+             obs = rgamma(n(), Amu^2 / sigma^2, Amu / sigma^2)) %>%
+      select(-c(Amu_mu, Amu_sigma, sigma))
+  ) %>%
+  pivot_longer(cols = c("Amu", "obs"),
+               names_to = "level", values_to = "Area")
 
-##########################################
+area_predictions %>%
+  ggplot(aes(Area, alpha = factor(level))) +
+    geom_density(colour = NA, fill = "black") +
+    scale_x_continuous(limits = c(0.3, 0.8), oob = scales::oob_keep) +
+    scale_alpha_manual(values = c(0.6, 0.2)) +
+    facet_wrap(~ Species, scales = "free") +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+# I will select only obs because I am interested including the potnetial variation
+# caused by cutting a new disc.
+area_predictions %>%
+  filter(level == "obs") %>%
+  ggplot(aes(Area)) +
+    geom_density(colour = NA, fill = "black") +
+    scale_x_continuous(limits = c(0.3, 0.8), oob = scales::oob_keep) +
+    scale_alpha_manual(values = c(0.6, 0.2)) +
+    facet_wrap(~ Species, scales = "free") +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
 
+# There is only one macroalgal species for which I have data but didn't measure
+# disc area: Fucus serratus. Hence the area prediction for unobserved species can
+# simply be assigned to F. serratus.
+
+area_predictions %<>%
+  filter(level == "obs") %>%
+  select(-level) %>%
+  mutate(Species = if_else(is.na(Species), "Fucus serratus", Species) %>%
+           fct())
+  
+# 4.5.4 Match area ####
+experimental_samples %<>%
+  left_join(area_predictions, 
+            by = c("Species", ".chain", ".iteration", ".draw"))
+
+# 4.5.5 Standardise ####
+# Activity needs to be expressed per volume for plankton, per mass for sediment
+# and macroalgae and per area for macroalgae. All incubations lasted one hour and
+# were done in 1 mL (0.001 L) of sterile seawater. The molar mass of the enzyme 
+# substrate is 338.31 g mol^-1. Since activity is presently given as µM h^-1, or
+# µmol L^-1 h^-1, it needs to be multiplied by 0.001 L and 338.31 g mol^-1 first.
+
+experimental_samples %<>%
+  mutate(Activity_mL = Activity * 0.001 * 338.31, # µg mL^-1 h^-1
+         Activity_g = Activity * 0.001 * 338.31 / Mass, # µg g^-1 h^-1
+         Activity_cm2 = Activity * 0.001 * 338.31 / Area) # µg cm^-2 h^-1
+
+rm(list = setdiff(ls(), c("experimental_samples")))
 
 # 5. Grazing experiment ####
+# 5.1 Prepare data ####
+grazing <- experimental_samples %>%
+  filter(str_starts(ID, "B") | str_starts(ID, "C")) %>%
+  mutate(Well = Well %>% fct_drop(),
+         Content = Content %>% fct_drop(),
+         ID = ID %>% fct_drop(),
+         Species = Species %>% fct_drop(),
+         Replicate = fct_cross(ID, Well, sep = "_"))
+
+snails <- here("Snails", "Snails.csv") %>% read.csv() %>%
+  mutate(ID = ID %>% fct(), Experiment = Experiment %>% fct(),
+         Flask = Flask %>% fct(), Start = Start %>% dmy_hm(),
+         End = End %>% dmy_hm(), Species = Species %>% fct(), 
+         Treatment = Treatment %>% fct(),
+         Days_accurate = Start %--% End %>% as.duration() / ddays())
+
+grazing %<>%
+  left_join(snails, by = c("ID", "Species"))
+
+grazing_summary <- grazing %>%
+  group_by(Experiment, ID, Replicate, Species, Treatment) %>%
+  summarise(Activity_g_mean = mean(Activity_g),
+            Activity_g_sd = sd(Activity_g),
+            Activity_cm2_mean = mean(Activity_cm2),
+            Activity_cm2_sd = sd(Activity_cm2),
+            n = length(Activity_g)) %>%
+  ungroup()
+
+# 5.2 Visualise data ####
+grazing_summary %>%
+  ggplot() +
+    stat_slab(aes(x = Activity_g_mean, y = Species, alpha = Treatment),
+              height = 1, colour = "black", size = 0.5, justification = - 0.3) +
+    # alternative to justification is Species %>% as.numeric() - 0.3 for geom_point
+    # geom_point(aes(x = Activity_g_mean, y = Species, alpha = Treatment),
+    #            position = position_jitter(height = 0.2), shape = 16) +
+    geom_pointrange(data = grazing_summary %>%
+                      group_by(ID, Species, Treatment) %>%
+                      summarise(Activity_g_mean_mean = mean(Activity_g_mean),
+                                Activity_g_mean_sd = sd(Activity_g_mean)),
+                    aes(x = Activity_g_mean_mean, xmin = Activity_g_mean_mean - Activity_g_mean_sd,
+                        xmax = Activity_g_mean_mean + Activity_g_mean_sd, y = Species, alpha = Treatment),
+                    position = position_jitter(height = 0.2), shape = 16) +
+    scale_alpha_manual(values = c(0.6, 0.4, 0.2)) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+
+grazing_summary %>%
+  ggplot() +
+  stat_slab(aes(x = Activity_cm2_mean, y = Species, alpha = Treatment),
+            height = 1, colour = "black", size = 0.5, justification = - 0.3) +
+  # alternative to justification is Species %>% as.numeric() - 0.3 for geom_point
+  # geom_point(aes(x = Activity_g_mean, y = Species, alpha = Treatment),
+  #            position = position_jitter(height = 0.2), shape = 16) +
+  geom_pointrange(data = grazing_summary %>%
+                    group_by(ID, Species, Treatment) %>%
+                    summarise(Activity_cm2_mean_mean = mean(Activity_cm2_mean),
+                              Activity_cm2_mean_sd = sd(Activity_cm2_mean)),
+                  aes(x = Activity_cm2_mean_mean, xmin = Activity_cm2_mean_mean - Activity_cm2_mean_sd,
+                      xmax = Activity_cm2_mean_mean + Activity_cm2_mean_sd, y = Species, alpha = Treatment),
+                  position = position_jitter(height = 0.2), shape = 16) +
+  scale_alpha_manual(values = c(0.6, 0.4, 0.2)) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+# 5.3 Model activity per gram ####
+# 5.3.1 Prior simulation ####
+grazing_summary %$%
+  mean(Activity_g_mean)
+
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(75), 0.5) %>% exp())) +
+  theme_minimal()
+
+# here is the underlying distribution
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(75), 0.5))) +
+  theme_minimal()
+
+# 5.3.2 Run model ####
+grazing_stan <- "
+data{
+  int n;
+  vector<lower=0>[n] Activity_g_mean;
+  array[n] int Species;
+  int n_Species;
+  array[n] int Treatment;
+  int n_Treatment;
+}
+
+parameters{
+  real alpha;
+  vector[n_Species] beta_S;
+  vector[n_Treatment] beta_T;
+  matrix[n_Species, n_Treatment] beta_S_T;
+  real<lower=0> sigma;
+}
+
+model{
+  alpha ~ normal( log(75) , 0.5 );
+  beta_S ~ normal( 0 , 0.5 );
+  beta_T ~ normal( 0 , 0.5 );
+  to_vector(beta_S_T) ~ normal( 0 , 0.5 );
+  sigma ~ exponential( 1 );
+
+  // Model
+  vector[n] mu;
+  for ( i in 1:n ) {
+    mu[i] = exp( alpha + beta_S[Species[i]] + beta_T[Treatment[i]] + 
+                 beta_S_T[Species[i], Treatment[i]] );
+  }
+
+  // Gamma likelihood (generalsied linear model)
+  Activity_g_mean ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+}
+"
+
+grazing_mod <- grazing_stan %>%
+  write_stan_file() %>%
+  cmdstan_model()
+
+grazing_samples <- grazing_mod$sample(
+  data = grazing_summary %>%
+    select(Activity_g_mean, Species, Treatment) %>%
+    compose_data(),
+  chains = 8,
+  parallel_chains = parallel::detectCores(),
+  iter_warmup = 1e4,
+  iter_sampling = 1e4)
+
+# 5.3.3 Model checks ####
+grazing_samples$summary() %>% View()
+
+# 5.3.4 Prior-posterior comparison ####
+
+
+# 5.3.5 Predictions ####
+
+
+# 5.4 Model activity per cm^2 ####
 
 
 # 6. Decomposition experiment ####
