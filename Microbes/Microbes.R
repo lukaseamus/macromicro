@@ -711,20 +711,19 @@ experimental <- enzyme %>%
 # Split each dataframe in experimental into its components
 experimental %<>% map(~ list(
   blank = .x %>% filter(Annotation %in% c("AS", "MQ")),
-  control = .x %>% filter(Annotation %in% c("CAS", "CMQ")),
+  # control = .x %>% filter(Annotation %in% c("CAS", "CMQ")), # I chose to include controls in samples
   standard = .x %>%
     filter(str_detect(Annotation, "^[0-9.]+$")) %>% 
     rename(Concentration = Annotation) %>%
     mutate(Concentration = as.numeric(Concentration)) %>%
     filter(between(Concentration, 0, 100)),
   samples = .x %>% filter(!str_detect(Annotation, "^[0-9.]+$") & 
-                            !Annotation %in% c("MQ", "AS", "CMQ", "CAS"))
+                            !Annotation %in% c("MQ", "AS"))
 ))
 
 str(experimental)
 
 experimental$X031121enzyme1$blank # examples
-experimental$X031121enzyme1$control
 experimental$X031121enzyme1$standard
 experimental$X031121enzyme1$samples
 
@@ -1135,58 +1134,317 @@ experimental_blank_predictions %>%
     theme_minimal() +
     theme(panel.grid = element_blank())
 
-# 4.3 Control models ####
-# To correctly calculate enzyme activities of experimental samples, a substrate autogenic
-# fluorescence control needs to be subtracted after conversion with the standard curve. If
-# the substrate control were subtracted before conversion with the standard curve, water
-# autofluorescence which is naturally contained within the substrate control would
-# effectively be subtracted twice, once with the control and once during conversion with
-# the standard curve which has the water blank as its intercept.
+# # 4.3 Control models ####
+# # To correctly calculate enzyme activities of experimental samples, a substrate autogenic
+# # fluorescence and contamination control needs to be subtracted after conversion with the 
+# # standard curve. If the substrate control were subtracted before conversion with the 
+# # standard curve, water autofluorescence which is naturally contained within the substrate 
+# # control would effectively be subtracted twice, once with the control and once during 
+# # conversion with the standard curve which has the water blank as its intercept.
+# 
+# # Visualise
+# experimental %>%
+#   imap(~ .x$control %>%
+#         ggplot(aes(Well, Fluorescence)) +
+#           geom_point(size = 3, shape = 16) +
+#           geom_hline(data = . %>% summarise(Fluorescence = median(Fluorescence)),
+#                      aes(yintercept = Fluorescence)) +
+#           theme_minimal() +
+#           ggtitle(.y)
+#   ) %>%
+#   wrap_plots() %>%
+#   ggsave(filename = "control_data.pdf", path = here("Plots"),
+#          width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# # unlike for the blanks, the control data are complete
+# 
+# # 4.3.1 Prior simulation ####
+# # Substrate autofluorescence is on average 500 arbitrary units relative to maximal 100 µM standard fluorescence.
+# # Since fluorescence cannot be negative, a gamma likelihood is best as for the water blank model. However, here
+# # there is no need for prediction of unobserved controls, because all plates included controls, so no 
+# # hierarchical model is necessary.
+# 
+# ggplot() +
+#   geom_density(aes(rnorm(1e5, log(500), 1) %>% exp())) +
+#   # scale_x_continuous(limits = c(0, 2e3), oob = scales::oob_keep) + # unhash to zoom in on peak
+#   theme_minimal()
+# # lots of variability
+# 
+# # here is the underlying distribution
+# ggplot() +
+#   geom_density(aes(rnorm(1e5, log(500), 1))) +
+#   theme_minimal()
+# 
+# # Additionally, via reparameterisation of the gamma likelihood in terms of mean (mu) and scale (theta),
+# # gamma( mu / theta, 1 / theta), I discovered that exponential(1) is too restrictive a prior on the 
+# # likelihood uncertainty. It worked with mean and scale, but not with mean and sd (sigma). 
+# # I kept my parameterisation but changed the prior to exponential(0.01).
+# 
+# # 4.3.2 Run model ####
+# experimental_control_stan <- "
+# data{
+#   int n;
+#   vector<lower=0>[n] Fluorescence;
+#   array[n] int Plate;
+#   int n_Plate;
+# }
+# 
+# parameters{
+#   real Fmu_mu; // Hyperparameters
+#   real<lower=0> Fmu_sigma;
+# 
+#   vector[n_Plate] Fmu;
+# 
+#   real<lower=0> sigma;
+# }
+# 
+# model{
+#   // Hyperpriors
+#   Fmu_mu ~ normal( log(500) , 1 );
+#   Fmu_sigma ~ exponential( 1 );
+# 
+#   // Plate-level prior
+#   Fmu ~ normal( Fmu_mu , Fmu_sigma );
+# 
+#   sigma ~ exponential( 0.01 );
+# 
+#   // Model
+#   vector[n] mu;
+#   for ( i in 1:n ) {
+#     mu[i] = exp( Fmu[Plate[i]] ); // Exponential transformation
+#   }
+# 
+#   // Gamma likelihood (generalsied linear model)
+#   Fluorescence ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+# }
+# "
+# 
+# experimental_control_mod <- experimental_control_stan %>%
+#   write_stan_file() %>%
+#   cmdstan_model()
+# 
+# experimental_control_samples <- experimental_control_mod$sample(
+#   data = experimental %>%
+#     map(~ .x$control) %>% # select only control subset
+#     bind_rows() %>%
+#     select(Fluorescence, Plate) %>%
+#     compose_data(),
+#   chains = 8,
+#   parallel_chains = parallel::detectCores(),
+#   iter_warmup = 1e4,
+#   iter_sampling = 1e4)
+# 
+# # 4.3.3 Model checks ####
+# # check Rhat, effective sample size and chains
+# experimental_control_samples$summary() %>%
+#   mutate(rhat_check = rhat > 1.001) %>%
+#   summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
+#             rhat_mean = mean(rhat),
+#             rhat_sd = sd(rhat),
+#             ess_mean = mean(ess_bulk),
+#             ess_sd = sd(ess_bulk))
+# # no rhat above 1.001
+# # good effective sample size
+# 
+# experimental_control_samples$draws(format = "df") %>%
+#   mcmc_rank_overlay()
+# # chains look good
+# 
+# # 4.3.4 Prior-posterior comparison ####
+# # sample prior
+# experimental_control_prior <- prior_samples(
+#   model = experimental_control_mod,
+#   data = experimental %>%
+#     map(~ .x$control) %>%
+#     bind_rows() %>%
+#     select(Fluorescence, Plate) %>%
+#     compose_data(),
+#   chains = 8, samples = 1e4)
+# 
+# # plot prior-posterior comparison
+# experimental_control_prior %>%
+#     prior_posterior_draws(posterior_samples = experimental_control_samples,
+#                           group = experimental %>%
+#                             map(~ .x$control) %>%
+#                             bind_rows() %>%
+#                             select(Plate),
+#                           parameters = c("Fmu[Plate]", "Fmu_mu", "Fmu_sigma", "sigma"),
+#                           format = "long") %>%
+#   prior_posterior_plot(group_name = "Plate")
+# 
+# # prior-posterior comparison in R
+# experimental_control_prior <-
+#   tibble(.chain = 1:8 %>% rep(each = 1e4),
+#          .iteration = 1:1e4 %>% rep(8),
+#          .draw = 1:8e4,
+#          Fmu_mu = rnorm(8 * 1e4, log(500) , 1),
+#          Fmu_sigma = rexp(8 * 1e4, 1),
+#          Fmu = rnorm(8 * 1e4, Fmu_mu, Fmu_sigma),
+#          sigma = rexp(8 * 1e4, 0.1)) %>%
+#   pivot_longer(cols = -starts_with("."),
+#                names_to = ".variable", values_to = ".value") %>%
+#   mutate(rep = if_else(.variable == "Fmu", 28, 1), # there are 28 plates
+#          .variable = fct_relevel(.variable, "Fmu")) %>%
+#   uncount(rep) %>%
+#   arrange(.variable) %>%
+#   mutate(Plate = experimental %>%
+#            map(~ .x$control) %>%
+#            bind_rows()  %$% levels(Plate) %>%
+#            rep(8 * 1e4) %>%
+#            c(NA %>% rep(3 * 8 * 1e4)))
+# 
+# experimental_control_posterior <-
+#   experimental_control_samples %>%
+#   recover_types(experimental %>%
+#                   map(~ .x$control) %>%
+#                   bind_rows() %>%
+#                   select(Plate)) %>%
+#   gather_draws(Fmu[Plate], Fmu_mu, Fmu_sigma, sigma) %>%
+#   ungroup()
+# 
+# experimental_control_prior %>%
+#   mutate(distribution = "prior") %>%
+#   bind_rows(experimental_control_posterior %>%
+#               mutate(distribution = "posterior")) %>%
+#   prior_posterior_plot(group_name = "Plate")
+# 
+# # 4.3.5 Predictions ####
+# experimental_control_predictions <-
+#   experimental_control_samples %>%
+#   recover_types(experimental %>%
+#                   map(~ .x$control) %>%
+#                   bind_rows() %>%
+#                   select(Plate)) %>%
+#   spread_draws(Fmu[Plate], sigma) %>%
+#   mutate(Fmu = exp(Fmu),
+#          obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
+#   select(-sigma) %>%
+#   bind_rows(
+#     experimental_control_samples %>%
+#       spread_draws(Fmu_mu, Fmu_sigma, sigma) %>%
+#       mutate(Fmu = exp( rnorm(n(), Fmu_mu, Fmu_sigma) ),
+#              obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
+#       select(-c(Fmu_mu, Fmu_sigma, sigma))
+#   ) %>%
+#   pivot_longer(cols = c("Fmu", "obs"),
+#                names_to = "level", values_to = "Fluorescence")
+# 
+# experimental_control_predictions %>%
+#   ggplot(aes(Fluorescence, alpha = factor(level))) +
+#     geom_density(colour = NA, fill = "black") +
+#     scale_x_continuous(limits = c(0, 2e3), oob = scales::oob_keep) +
+#     scale_alpha_manual(values = c(0.6, 0.2)) +
+#     facet_wrap(~ Plate, scales = "free") +
+#     theme_minimal() +
+#     theme(panel.grid = element_blank())
+# # It makes most sense to me to use Fmu since that is what I used for the water blank.
+# experimental_control_predictions %>%
+#   filter(level == "Fmu") %>%
+#   ggplot(aes(Fluorescence)) +
+#     geom_density(colour = NA, fill = "black") +
+#     scale_x_continuous(limits = c(0, 1.2e3), oob = scales::oob_keep) +
+#     facet_wrap(~ Plate, scales = "free") +
+#     theme_minimal() +
+#     theme(panel.grid = element_blank())
+# 
+# rm(list = setdiff(ls(), c("enzyme", "meta", "experimental", "experimental_standard_samples", 
+#                           "experimental_blank_samples", "experimental_standard_samples", 
+#                           "experimental_blank_predictions", "experimental_control_predictions")))
 
-# Visualise
-experimental %>%
-  imap(~ .x$control %>%
-        ggplot(aes(Well, Fluorescence)) +
-          geom_point(size = 3, shape = 16) +
-          geom_hline(data = . %>% summarise(Fluorescence = median(Fluorescence)),
-                     aes(yintercept = Fluorescence)) +
-          theme_minimal() +
-          ggtitle(.y)
+# 4.4 Conversion ####
+# solving F = Fmax * beta * c / ( Fmax + beta * c ) + F0 for c
+# gives c = Fmax * ( F - F0 ) / ( beta * ( F0 + Fmax - F ) )
+
+# 4.4.1 Combine posteriors ####
+experimental_standard <- experimental_standard_samples %>%
+  imap(~ .x %>% spread_draws(Fmax, beta, F0) %>%
+         mutate(Plate = str_remove(.y, "^X") %>% fct())) %>%
+  bind_rows()
+
+experimental_blank <- experimental_blank_predictions %>%
+  filter(!is.na(Plate)) %>% # filter out predictions for unobserved plates
+  bind_rows(
+    experimental_blank_predictions %>%
+      filter(is.na(Plate)) %>% # replicate prediction for unobserved plates
+      slice(rep(1:n(), each = 4)) %>% # and allocate unobserved plate names
+      mutate(Plate = c("281021enzyme1", "281021enzyme3",
+                       "281021enzyme5", "281021enzyme7") %>%
+               rep(length.out = n()) %>% fct())
   ) %>%
-  wrap_plots() %>%
-  ggsave(filename = "control_data.pdf", path = here("Plots"),
-         width = 80, height = 40, unit = "cm", device = cairo_pdf)
-# unlike for the blanks, the control data are complete
+  filter(level == "Fmu") %>%
+  select(-level) %>%
+  rename(blank = Fluorescence)
+  
+# # Here's how to do the opposite: turn a grouped tibble into a named list
+# experimental_blank_predictions %>%
+#   filter(level == "Fmu") %>%
+#   select(-level) %>%
+#   rename(blank = Fluorescence) %>%
+#   group_by(Group) %>%
+#   group_split() %>%
+#   set_names(
+#     map(., ~ .x$Group[1])
+#   ) %>%
+#   map(~ .x %>% select(-Group))
+# # But this enables less control over calculations that require group matching
 
-# 4.3.1 Prior simulation ####
-# Substrate autofluorescence is on average 500 arbitrary units relative to maximal 100 µM standard fluorescence.
-# Since fluorescence cannot be negative, a gamma likelihood is best as for the water blank model. However, here
-# there is no need for prediction of unobserved controls, because all plates included controls, so no 
-# hierarchical model is necessary.
+# experimental_control <- experimental_control_predictions %>%
+#   filter(!is.na(Plate) & level == "Fmu") %>% # filter out predictions for unobserved plates
+#   select(-level) %>% # (no predictions for unobserved plates to be made here)
+#   rename(control = Fluorescence)
 
-ggplot() +
-  geom_density(aes(rnorm(1e5, log(500), 1) %>% exp())) +
-  # scale_x_continuous(limits = c(0, 2e3), oob = scales::oob_keep) + # unhash to zoom in on peak
-  theme_minimal()
-# lots of variability
+experimental_parameters <- experimental_standard %>%
+  full_join(experimental_blank,
+            by = c("Plate", ".chain", ".iteration", ".draw"))
 
-# here is the underlying distribution
-ggplot() +
-  geom_density(aes(rnorm(1e5, log(500), 1))) +
-  theme_minimal()
 
-# Additionally, via reparameterisation of the gamma likelihood in terms of mean (mu) and scale (theta),
-# gamma( mu / theta, 1 / theta), I discovered that exponential(1) is too restrictive a prior on the 
-# likelihood uncertainty. It worked with mean and scale, but not with mean and sd (sigma). 
-# I kept my parameterisation but changed the prior to exponential(0.01).
+# 4.4.2 Convert sample fluorescence ####
+experimental_samples <- experimental %>%
+  map(~ .x$samples) %>% # select samples
+  bind_rows() %>% # convert list to tibble
+  rename(ID = Annotation) %>%
+  mutate(ID = if_else(ID %in% c("CMQ", "CAS"), # create plate-specific control name
+                      str_c(Plate, "control", sep = "_"), 
+                      ID) %>% fct()) %>%
+  full_join(experimental_parameters,
+            by = "Plate",
+            relationship = "many-to-many") %>%
+  # mutate(# replace F0 with blank and convert sample and control fluorescence to enzyme activity
+  #        Activity_raw = ( Fmax * ( Fluorescence - blank ) / ( beta * ( blank + Fmax - Fluorescence ) ) ),
+  #        Activity_control = ( Fmax * ( control - blank ) / ( beta * ( blank + Fmax - control ) ) ),
+  #        # correct sample enzyme activity by subtracting the converted control
+  #        Activity = Activity_raw - Activity_control, # µM h^-1
+  #        ID = ID %>% fct())
+  mutate(# replace F0 with blank and convert sample and control fluorescence to enzyme activity
+         Activity = ( Fmax * ( Fluorescence - blank ) / ( beta * ( blank + Fmax - Fluorescence ) ) ))
+# maybe add sigma?
+str(experimental_samples)
 
-# 4.3.2 Run model ####
-experimental_control_stan <- "
+# 4.5 Technical replication ####
+# In addition to measurement error introduced by the standard curve, control, and standardisation,
+# wells vary across microplates due to composition, contamination or pipetting error. This source
+# of error was accounted for by including five replicate wells for each biological replicate. The
+# most intuitive way to add this source of error to the mix is by estimating an intercept across
+# technical replicates for each biological replicate.
+
+# 4.5.1 Summarise data ####
+experimental_samples_summary <- experimental_samples %>%
+  mutate(Replicate = fct_cross(ID, Well, sep = "_")) %>%
+  group_by(Replicate, Well, Content, Fluorescence, Date,
+           Plate, ID, Plate_number) %>%
+  summarise(Activity_mean = mean(Activity), # this
+            Activity_sd = sd(Activity),
+            n = length(Activity)) %>%
+  ungroup()
+
+
+################################################
+
+technical_stan <- "
 data{
   int n;
-  vector<lower=0>[n] Fluorescence;
-  array[n] int Plate;
-  int n_Plate;
+  vector<lower=0>[n] Activity;
+  array[n] int ID;
+  int n_ID;
 }
 
 parameters{
@@ -1234,190 +1492,14 @@ experimental_control_samples <- experimental_control_mod$sample(
   iter_warmup = 1e4,
   iter_sampling = 1e4)
 
-# 4.3.3 Model checks ####
-# check Rhat, effective sample size and chains
-experimental_control_samples$summary() %>%
-  mutate(rhat_check = rhat > 1.001) %>%
-  summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
-            rhat_mean = mean(rhat),
-            rhat_sd = sd(rhat),
-            ess_mean = mean(ess_bulk),
-            ess_sd = sd(ess_bulk))
-# no rhat above 1.001
-# good effective sample size
 
-experimental_control_samples$draws(format = "df") %>%
-  mcmc_rank_overlay()
-# chains look good
 
-# 4.3.4 Prior-posterior comparison ####
-# sample prior
-experimental_control_prior <- prior_samples(
-  model = experimental_control_mod,
-  data = experimental %>%
-    map(~ .x$control) %>%
-    bind_rows() %>%
-    select(Fluorescence, Plate) %>%
-    compose_data(),
-  chains = 8, samples = 1e4)
 
-# plot prior-posterior comparison
-experimental_control_prior %>%
-    prior_posterior_draws(posterior_samples = experimental_control_samples,
-                          group = experimental %>%
-                            map(~ .x$control) %>%
-                            bind_rows() %>%
-                            select(Plate),
-                          parameters = c("Fmu[Plate]", "Fmu_mu", "Fmu_sigma", "sigma"),
-                          format = "long") %>%
-  prior_posterior_plot(group_name = "Plate")
 
-# prior-posterior comparison in R
-experimental_control_prior <-
-  tibble(.chain = 1:8 %>% rep(each = 1e4),
-         .iteration = 1:1e4 %>% rep(8),
-         .draw = 1:8e4,
-         Fmu_mu = rnorm(8 * 1e4, log(500) , 1),
-         Fmu_sigma = rexp(8 * 1e4, 1),
-         Fmu = rnorm(8 * 1e4, Fmu_mu, Fmu_sigma),
-         sigma = rexp(8 * 1e4, 0.1)) %>%
-  pivot_longer(cols = -starts_with("."),
-               names_to = ".variable", values_to = ".value") %>%
-  mutate(rep = if_else(.variable == "Fmu", 28, 1), # there are 28 plates
-         .variable = fct_relevel(.variable, "Fmu")) %>%
-  uncount(rep) %>%
-  arrange(.variable) %>%
-  mutate(Plate = experimental %>%
-           map(~ .x$control) %>%
-           bind_rows()  %$% levels(Plate) %>%
-           rep(8 * 1e4) %>%
-           c(NA %>% rep(3 * 8 * 1e4)))
 
-experimental_control_posterior <-
-  experimental_control_samples %>%
-  recover_types(experimental %>%
-                  map(~ .x$control) %>%
-                  bind_rows() %>%
-                  select(Plate)) %>%
-  gather_draws(Fmu[Plate], Fmu_mu, Fmu_sigma, sigma) %>%
-  ungroup()
 
-experimental_control_prior %>%
-  mutate(distribution = "prior") %>%
-  bind_rows(experimental_control_posterior %>%
-              mutate(distribution = "posterior")) %>%
-  prior_posterior_plot(group_name = "Plate")
-
-# 4.3.5 Predictions ####
-experimental_control_predictions <-
-  experimental_control_samples %>%
-  recover_types(experimental %>%
-                  map(~ .x$control) %>%
-                  bind_rows() %>%
-                  select(Plate)) %>%
-  spread_draws(Fmu[Plate], sigma) %>%
-  mutate(Fmu = exp(Fmu),
-         obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
-  select(-sigma) %>%
-  bind_rows(
-    experimental_control_samples %>%
-      spread_draws(Fmu_mu, Fmu_sigma, sigma) %>%
-      mutate(Fmu = exp( rnorm(n(), Fmu_mu, Fmu_sigma) ),
-             obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
-      select(-c(Fmu_mu, Fmu_sigma, sigma))
-  ) %>%
-  pivot_longer(cols = c("Fmu", "obs"),
-               names_to = "level", values_to = "Fluorescence")
-
-experimental_control_predictions %>%
-  ggplot(aes(Fluorescence, alpha = factor(level))) +
-    geom_density(colour = NA, fill = "black") +
-    scale_x_continuous(limits = c(0, 2e3), oob = scales::oob_keep) +
-    scale_alpha_manual(values = c(0.6, 0.2)) +
-    facet_wrap(~ Plate, scales = "free") +
-    theme_minimal() +
-    theme(panel.grid = element_blank())
-# It makes most sense to me to use Fmu since that is what I used for the water blank.
-experimental_control_predictions %>%
-  filter(level == "Fmu") %>%
-  ggplot(aes(Fluorescence)) +
-    geom_density(colour = NA, fill = "black") +
-    scale_x_continuous(limits = c(0, 1.2e3), oob = scales::oob_keep) +
-    facet_wrap(~ Plate, scales = "free") +
-    theme_minimal() +
-    theme(panel.grid = element_blank())
-
-rm(list = setdiff(ls(), c("enzyme", "meta", "experimental", "experimental_standard_samples", 
-                          "experimental_blank_samples", "experimental_standard_samples", 
-                          "experimental_blank_predictions", "experimental_control_predictions")))
-
-# 4.4 Conversion ####
-# solving F = Fmax * beta * c / ( Fmax + beta * c ) + F0 for c
-# gives c = Fmax * ( F - F0 ) / ( beta * ( F0 + Fmax - F ) )
-
-# 4.4.1 Combine posteriors ####
-experimental_standard <- experimental_standard_samples %>%
-  imap(~ .x %>% spread_draws(Fmax, beta, F0) %>%
-         mutate(Plate = str_remove(.y, "^X") %>% fct())) %>%
-  bind_rows()
-
-experimental_blank <- experimental_blank_predictions %>%
-  filter(!is.na(Plate)) %>% # filter out predictions for unobserved plates
-  bind_rows(
-    experimental_blank_predictions %>%
-      filter(is.na(Plate)) %>% # replicate prediction for unobserved plates
-      slice(rep(1:n(), each = 4)) %>% # and allocate unobserved plate names
-      mutate(Plate = c("281021enzyme1", "281021enzyme3",
-                       "281021enzyme5", "281021enzyme7") %>%
-               rep(length.out = n()) %>% fct())
-  ) %>%
-  filter(level == "Fmu") %>%
-  select(-level) %>%
-  rename(blank = Fluorescence)
-  
-experimental_control <- experimental_control_predictions %>%
-  filter(!is.na(Plate) & level == "Fmu") %>% # filter out predictions for unobserved plates
-  select(-level) %>% # (no predictions for unobserved plates to be made here)
-  rename(control = Fluorescence)
-
-experimental_parameters <- experimental_standard %>%
-  full_join(experimental_blank,
-            by = c("Plate", ".chain", ".iteration", ".draw")) %>%
-  full_join(experimental_control,
-            by = c("Plate", ".chain", ".iteration", ".draw"))
-
-# # Here's how to do the opposite: turn a grouped tibble into a named list
-# experimental_blank_predictions %>%
-#   filter(level == "Fmu") %>%
-#   select(-level) %>%
-#   rename(blank = Fluorescence) %>%
-#   group_by(Group) %>%
-#   group_split() %>%
-#   set_names(
-#     map(., ~ .x$Group[1])
-#   ) %>%
-#   map(~ .x %>% select(-Group))
-# # But this enables less control over calculations that require group matching
-
-# 4.4.2 Convert sample fluorescence ####
-experimental_samples <- experimental %>%
-  map(~ .x$samples) %>% # select samples
-  bind_rows() %>% # convert list to tibble
-  rename(ID = Annotation) %>%
-  full_join(experimental_parameters,
-            by = "Plate",
-            relationship = "many-to-many") %>%
-  mutate(# replace F0 with blank and convert sample and control fluorescence to enzyme activity
-         Activity_raw = ( Fmax * ( Fluorescence - blank ) / ( beta * ( blank + Fmax - Fluorescence ) ) ),
-         Activity_control = ( Fmax * ( control - blank ) / ( beta * ( blank + Fmax - control ) ) ),
-         # correct sample enzyme activity by subtracting the converted control
-         Activity = Activity_raw - Activity_control,
-         ID = ID %>% fct())
-
-str(experimental_samples)
-
-# 4.5 Standardisation ####
-# 4.5.1 Load area and mass data ####
+# 4.6 Standardisation ####
+# 4.6.1 Load area and mass data ####
 area <- here("Microbes", "Disc_Area.csv") %>% read.csv() %>%
   mutate(Species = Species %>% fct())
 # Disc area (cm^2) was measured for a few random replicates of each species.
@@ -1449,7 +1531,7 @@ mass %>%
     theme_minimal() +
     theme(panel.grid = element_blank())
 
-# 4.5.2 Match mass ####
+# 4.6.2 Match mass ####
 # Extracellular enzyme activity can either be reported per cm^2 or per g. I will have a look at both.
 # Because disc area was not measured for each disc, it needs to be approximated by modelling. Disc mass
 # on the other hand can directly be included in the calculation.
@@ -1459,7 +1541,7 @@ experimental_samples %<>%
               rename(Date_weighed = Date), 
             by = "ID")
 
-# 4.5.3 Model area ####
+# 4.6.3 Model area ####
 # The grand mean seems to be close to 0.55 cm^2.
 ggplot() +
   geom_density(aes(rnorm(1e5, log(0.55), 0.2) %>% exp())) +
@@ -1604,12 +1686,12 @@ area_predictions %<>%
   mutate(Species = if_else(is.na(Species), "Fucus serratus", Species) %>%
            fct())
   
-# 4.5.4 Match area ####
+# 4.6.4 Match area ####
 experimental_samples %<>%
   left_join(area_predictions, 
             by = c("Species", ".chain", ".iteration", ".draw"))
 
-# 4.5.5 Standardise ####
+# 4.6.5 Standardise ####
 # Activity needs to be expressed per volume for plankton, per mass for sediment
 # and macroalgae and per area for macroalgae. All incubations lasted one hour and
 # were done in 1 mL (0.001 L) of sterile seawater. The molar mass of the enzyme 
@@ -1641,7 +1723,8 @@ snails <- here("Snails", "Snails.csv") %>% read.csv() %>%
          Days_accurate = Start %--% End %>% as.duration() / ddays())
 
 grazing %<>%
-  left_join(snails, by = c("ID", "Species"))
+  left_join(snails, by = c("ID", "Species")) %>%
+  mutate(ID = ID %>% fct_drop())
 
 grazing_summary <- grazing %>%
   group_by(Experiment, ID, Replicate, Species, Treatment) %>%
@@ -1708,17 +1791,22 @@ grazing_stan <- "
 data{
   int n;
   vector<lower=0>[n] Activity_g_mean;
+  vector<lower=0>[n] Activity_g_sd;
   array[n] int Species;
   int n_Species;
   array[n] int Treatment;
   int n_Treatment;
+  array[n] int ID;
+  int n_ID;
 }
 
 parameters{
+  vector<lower=0>[n] Activity_g;
   real alpha;
   vector[n_Species] beta_S;
   vector[n_Treatment] beta_T;
   matrix[n_Species, n_Treatment] beta_S_T;
+  vector[n_ID] beta_ID;
   real<lower=0> sigma;
 }
 
@@ -1727,17 +1815,20 @@ model{
   beta_S ~ normal( 0 , 0.5 );
   beta_T ~ normal( 0 , 0.5 );
   to_vector(beta_S_T) ~ normal( 0 , 0.5 );
+  beta_ID ~ normal( 0 , 0.5 );
   sigma ~ exponential( 1 );
 
   // Model
   vector[n] mu;
   for ( i in 1:n ) {
     mu[i] = exp( alpha + beta_S[Species[i]] + beta_T[Treatment[i]] + 
-                 beta_S_T[Species[i], Treatment[i]] );
+                 beta_S_T[Species[i], Treatment[i]] + beta_ID[ID[i]] );
   }
 
-  // Gamma likelihood (generalsied linear model)
-  Activity_g_mean ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+  // Gamma likelihood (generalised linear model)
+  Activity_g ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+  // with normal measurement error
+  Activity_g_mean ~ normal( Activity_g , Activity_g_sd );
 }
 "
 
@@ -1747,7 +1838,8 @@ grazing_mod <- grazing_stan %>%
 
 grazing_samples <- grazing_mod$sample(
   data = grazing_summary %>%
-    select(Activity_g_mean, Species, Treatment) %>%
+    select(Activity_g_mean, Activity_g_sd,
+           Species, Treatment, ID) %>%
     compose_data(),
   chains = 8,
   parallel_chains = parallel::detectCores(),
@@ -1755,7 +1847,69 @@ grazing_samples <- grazing_mod$sample(
   iter_sampling = 1e4)
 
 # 5.3.3 Model checks ####
-grazing_samples$summary() %>% View()
+grazing_samples %>%
+  recover_types(grazing_summary %>%
+                  select(Species, Treatment, ID)) %>%
+  spread_draws(alpha, beta_S[Species], beta_T[Treatment], beta_S_T[Species, Treatment], beta_ID[ID]) %>%
+  ungroup() %>%
+  mutate(sum = alpha + beta_S + beta_T + beta_S_T + beta_ID) %>%
+  group_by(Species, Treatment) %>%
+  summarise(mean = mean(sum),
+            sd = sd(sum))
+
+# with ID
+# Species                Treatment               mean    sd
+# <fct>                  <fct>                  <dbl> <dbl>
+# 1 Laminaria digitata     Steromphala cineraria   3.58  1.46
+# 2 Laminaria digitata     Autogenic control       2.85  1.43
+# 3 Laminaria digitata     Calliostoma zizyphinum  2.76  1.47
+# 4 Laminaria hyperborea   Steromphala cineraria   3.67  1.46
+# 5 Laminaria hyperborea   Autogenic control       3.00  1.45
+# 6 Laminaria hyperborea   Calliostoma zizyphinum  3.33  1.46
+# 7 Saccorhiza polyschides Steromphala cineraria   3.43  1.53
+# 8 Saccorhiza polyschides Autogenic control       2.88  1.45
+# 9 Saccorhiza polyschides Calliostoma zizyphinum  3.58  1.48
+# 10 Saccharina latissima   Steromphala cineraria   3.78  1.47
+# 11 Saccharina latissima   Autogenic control       3.32  1.46
+# 12 Saccharina latissima   Calliostoma zizyphinum  3.54  1.47
+
+# without ID
+# Species                Treatment               mean     sd
+# <fct>                  <fct>                  <dbl>  <dbl>
+# 1 Laminaria digitata     Steromphala cineraria   4.37 0.107 
+# 2 Laminaria digitata     Autogenic control       3.85 0.0890
+# 3 Laminaria digitata     Calliostoma zizyphinum  3.83 0.132 
+# 4 Laminaria hyperborea   Steromphala cineraria   4.25 0.115 
+# 5 Laminaria hyperborea   Autogenic control       3.91 0.0895
+# 6 Laminaria hyperborea   Calliostoma zizyphinum  4.03 0.117 
+# 7 Saccorhiza polyschides Steromphala cineraria   4.41 0.126 
+# 8 Saccorhiza polyschides Autogenic control       4.37 0.114 
+# 9 Saccorhiza polyschides Calliostoma zizyphinum  4.42 0.114 
+# 10 Saccharina latissima   Steromphala cineraria   4.19 0.120 
+# 11 Saccharina latissima   Autogenic control       4.40 0.0899
+# 12 Saccharina latissima   Calliostoma zizyphinum  4.23 0.114 
+
+# with ID but not multilevel
+# Species                Treatment               mean    sd
+# <fct>                  <fct>                  <dbl> <dbl>
+# 1 Laminaria digitata     Steromphala cineraria   3.90 0.998
+# 2 Laminaria digitata     Autogenic control       2.95 0.987
+# 3 Laminaria digitata     Calliostoma zizyphinum  2.51 1.01 
+# 4 Laminaria hyperborea   Steromphala cineraria   3.89 0.999
+# 5 Laminaria hyperborea   Autogenic control       3.10 1.01 
+# 6 Laminaria hyperborea   Calliostoma zizyphinum  3.41 1.00 
+# 7 Saccorhiza polyschides Steromphala cineraria   4.05 1.10 
+# 8 Saccorhiza polyschides Autogenic control       3.62 1.04 
+# 9 Saccorhiza polyschides Calliostoma zizyphinum  4.16 0.998
+# 10 Saccharina latissima   Steromphala cineraria   3.96 0.998
+# 11 Saccharina latissima   Autogenic control       3.74 1.03 
+# 12 Saccharina latissima   Calliostoma zizyphinum  3.69 1.03 
+
+
+grazing_summary %>%
+  group_by(Species, Treatment) %>%
+  summarise(mean = mean(Activity_g_mean),
+            sd = sd(Activity_g_mean))
 
 # 5.3.4 Prior-posterior comparison ####
 
