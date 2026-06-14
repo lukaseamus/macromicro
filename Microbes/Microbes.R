@@ -603,9 +603,9 @@ kinetics_standard_rh_predictions_summary %>%
   imap(~ .x + ggtitle(.y)) %>%
   wrap_plots()
 # rectangular hyperbola is clearly the best!
-# it only slightly overestimates the intercept when beta is low
-# and underestimates it when beta is high, but that is less worrisome 
-# because I will adjust the intercept based on water autofluorescence
+# It slightly overestimates the intercept when beta is low and underestimates 
+# it when beta is high, but that is less worrisome because I will adjust the 
+# intercept based on water autofluorescence.
 
 # 2.1.16 Compare functions ####
 kinetics_standard_predictions_summary <- 
@@ -874,8 +874,8 @@ experimental_standard_predictions <- experimental_standard_prior %>%
                                group = list(NA),
                                parameters = c("Fmax", "beta", "F0", "sigma"),
                                format = "short")) %>%
-  map2(experimental, 
-       ~ spread_continuous(.x, .y$standard, 
+  map2(experimental,
+       ~ spread_continuous(.x, .y$standard,
                            predictor_name = "Concentration",
                            length = 50)) %>%
   map(~ .x %>% mutate(mu = Fmax * beta * Concentration / ( Fmax + beta * Concentration ) + F0,
@@ -1346,17 +1346,14 @@ experimental_blank_predictions %>%
 #     theme_minimal() +
 #     theme(panel.grid = element_blank())
 # 
-# rm(list = setdiff(ls(), c("enzyme", "meta", "experimental", "experimental_standard_samples", 
-#                           "experimental_blank_samples", "experimental_standard_samples", 
-#                           "experimental_blank_predictions", "experimental_control_predictions")))
+rm(list = setdiff(ls(), c("enzyme", "meta", "experimental", "experimental_standard_samples",
+                          "experimental_blank_samples", "experimental_blank_predictions", 
+                          "experimental standard", "experimental blank", "experimental_standard_corrected")))
 
 # 4.4 Conversion ####
-# solving F = Fmax * beta * c / ( Fmax + beta * c ) + F0 for c
-# gives c = Fmax * ( F - F0 ) / ( beta * ( F0 + Fmax - F ) )
-
 # 4.4.1 Combine posteriors ####
 experimental_standard <- experimental_standard_samples %>%
-  imap(~ .x %>% spread_draws(Fmax, beta, F0) %>%
+  imap(~ .x %>% spread_draws(Fmax, beta, F0, sigma) %>%
          mutate(Plate = str_remove(.y, "^X") %>% fct())) %>%
   bind_rows()
 
@@ -1392,20 +1389,61 @@ experimental_blank <- experimental_blank_predictions %>%
 #   select(-level) %>% # (no predictions for unobserved plates to be made here)
 #   rename(control = Fluorescence)
 
-experimental_parameters <- experimental_standard %>%
+experimental_standard_corrected <- experimental_standard %>%
   full_join(experimental_blank,
             by = c("Plate", ".chain", ".iteration", ".draw"))
 
 
 # 4.4.2 Convert sample fluorescence ####
+# Visualise blank-corrected standard curve
+experimental_standard_corrected_prediction <- experimental_standard_corrected %>%
+  expand_grid(Concentration = seq(0, 100, length.out = 50)) %>%
+  mutate(mu = Fmax * beta * Concentration / ( Fmax + beta * Concentration ) + blank, # note blank substitution
+         obs = rnorm(n(), mu, sigma)) %>%
+  group_by(Plate, Concentration) %>%
+  reframe(mu = mu %>% mean_qi(.width = c(.5, .8, .9)),
+          obs = obs %>% mean_qi(.width = c(.5, .8, .9))) %>%
+  unnest(c(mu, obs), names_sep = "_")
+
+ggsave(
+  experimental_standard_corrected_prediction %>%
+    ggplot() +
+      geom_point(data = experimental %>% 
+                   imap(~ .x$standard) %>%
+                   bind_rows(),
+                 aes(Concentration, Fluorescence)) +
+      geom_line(aes(Concentration, mu_y)) +
+      geom_ribbon(aes(Concentration, ymin = mu_ymin, ymax = mu_ymax,
+                  alpha = factor(mu_.width))) +
+      geom_ribbon(aes(Concentration, ymin = obs_ymin, ymax = obs_ymax,
+                  alpha = factor(obs_.width))) +
+      scale_alpha_manual(values = c(0.5, 0.4, 0.3), guide = "none") +
+      facet_wrap(~ Plate, scales = "free") +
+      # coord_cartesian(xlim = c(0, 1), ylim = c(0, 5e3)) + # unhash to check F0
+      theme_minimal() +
+      theme(panel.grid = element_blank()),
+  filename = "standard_corrected_predictions.pdf", path = here("Plots"),
+  width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# Substitution did what I intended. The intercept is now much more realistic. The
+# principal remaining drawback is that predictions of observations yield negative
+# values at low concentrations due to the normal likelihood. I have attempted
+# a generalised nonlinear model with a gamma likelihood to ensure positive 
+# predictions, but interpretation of the parameters Fmax and beta becomes difficult.
+# The easiest solution is to ignore sigma and predict using estimates for mu, 
+# which are enforced to be positive by the gamma priors on all parameters.
+
+# Solving F = Fmax * beta * c / ( Fmax + beta * c ) + F0 for c
+# gives c = Fmax * ( F - F0 ) / ( beta * ( F0 + Fmax - F ) ).
+
 experimental_samples <- experimental %>%
   map(~ .x$samples) %>% # select samples
   bind_rows() %>% # convert list to tibble
   rename(ID = Annotation) %>%
   mutate(ID = if_else(ID %in% c("CMQ", "CAS"), # create plate-specific control name
                       str_c(Plate, "control", sep = "_"), 
-                      ID) %>% fct()) %>%
-  full_join(experimental_parameters,
+                      ID) %>% fct(),
+         Replicate = fct_cross(ID, Well, sep = "_")) %>%
+  full_join(experimental_standard_corrected,
             by = "Plate",
             relationship = "many-to-many") %>%
   # mutate(# replace F0 with blank and convert sample and control fluorescence to enzyme activity
@@ -1416,7 +1454,7 @@ experimental_samples <- experimental %>%
   #        ID = ID %>% fct())
   mutate(# replace F0 with blank and convert sample and control fluorescence to enzyme activity
          Activity = ( Fmax * ( Fluorescence - blank ) / ( beta * ( blank + Fmax - Fluorescence ) ) ))
-# maybe add sigma?
+
 str(experimental_samples)
 
 # 4.5 Technical replication ####
@@ -1426,66 +1464,89 @@ str(experimental_samples)
 # most intuitive way to add this source of error to the mix is by estimating an intercept across
 # technical replicates for each biological replicate.
 
+# Visualise
+ggsave(
+  experimental_samples %>%
+    ggplot() +
+      geom_violin(aes(x = ID, y = Activity, group = Replicate)) +
+      facet_wrap(~ Plate, scales = "free") +
+      theme_minimal() +
+      theme(panel.grid = element_blank()),
+  filename = "replication_data.pdf", path = here("Plots"),
+  width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# There are some thin tails that extend into the negative for the plates that didn't include
+# blanks leading to less certain predictions, including some few where the blank is greater
+# than the control or sample.
+
 # 4.5.1 Summarise data ####
 experimental_samples_summary <- experimental_samples %>%
-  mutate(Replicate = fct_cross(ID, Well, sep = "_")) %>%
-  group_by(Replicate, Well, Content, Fluorescence, Date,
-           Plate, ID, Plate_number) %>%
+  group_by(Well, Content, Fluorescence, Date,
+           Plate, ID, Plate_number, Replicate) %>%
   summarise(Activity_mean = mean(Activity), # this
             Activity_sd = sd(Activity),
             n = length(Activity)) %>%
   ungroup()
 
+# 4.5.2 Prior simulation ####
+# I am not going to run a multilevel model as with the blanks since I have no wish to predict
+# for unobserved cases and there is no need for regularisation through partial pooling. On the
+# contrary, regularisation on this level would be bad because fluorescence values are uniquely 
+# gain-adjusted for each plate and therefore not comparable. I made an exception for blanks.
+experimental_samples_summary %$% range(Activity_mean)
+experimental_samples_summary %$% mean(Activity_mean)
 
-################################################
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(2.4), 1) %>% exp())) +
+  scale_x_continuous(limits = c(0, 100), oob = scales::oob_keep) +
+  theme_minimal()
+# lots of variability
 
-technical_stan <- "
+# here is the underlying distribution
+ggplot() +
+  geom_density(aes(rnorm(1e5, log(2.4), 1))) +
+  theme_minimal()
+
+# 4.5.3 Run model ####
+experimental_replication_stan <- "
 data{
   int n;
-  vector<lower=0>[n] Activity;
+  vector<lower=0>[n] Activity_mean;
+  vector<lower=0>[n] Activity_sd;
   array[n] int ID;
   int n_ID;
 }
 
 parameters{
-  real Fmu_mu; // Hyperparameters
-  real<lower=0> Fmu_sigma;
-
-  vector[n_Plate] Fmu;
-
+  vector<lower=0>[n] Activity;
+  vector[n_ID] Activity_mu;
   real<lower=0> sigma;
 }
 
 model{
-  // Hyperpriors
-  Fmu_mu ~ normal( log(500) , 1 );
-  Fmu_sigma ~ exponential( 1 );
-
-  // Plate-level prior
-  Fmu ~ normal( Fmu_mu , Fmu_sigma );
-
-  sigma ~ exponential( 0.01 );
+  // Priors
+  Activity_mu ~ normal( log(2.4) , 1 );
+  sigma ~ exponential( 1 );
 
   // Model
   vector[n] mu;
   for ( i in 1:n ) {
-    mu[i] = exp( Fmu[Plate[i]] ); // Exponential transformation
+    mu[i] = exp( Activity_mu[ID[i]] ); // Exponential transformation
   }
 
-  // Gamma likelihood (generalsied linear model)
-  Fluorescence ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+  // Gamma likelihood (generalised linear model)
+  Activity ~ gamma( mu^2 / sigma^2 , mu / sigma^2 );
+  // with gamma measurement error (note elementwise division)
+  Activity_mean ~ gamma( Activity^2 ./ Activity_sd^2 , Activity ./ Activity_sd^2 );
 }
 "
 
-experimental_control_mod <- experimental_control_stan %>%
+experimental_replication_mod <- experimental_replication_stan %>%
   write_stan_file() %>%
   cmdstan_model()
 
-experimental_control_samples <- experimental_control_mod$sample(
-  data = experimental %>%
-    map(~ .x$control) %>% # select only control subset
-    bind_rows() %>%
-    select(Fluorescence, Plate) %>%
+experimental_replication_samples <- experimental_replication_mod$sample(
+  data = experimental_samples_summary %>%
+    select(Activity_mean, Activity_sd, ID) %>%
     compose_data(),
   chains = 8,
   parallel_chains = parallel::detectCores(),
@@ -1493,6 +1554,132 @@ experimental_control_samples <- experimental_control_mod$sample(
   iter_sampling = 1e4)
 
 
+# 4.5.4 Model checks ####
+# check Rhat, effective sample size and chains
+experimental_replication_samples$summary() %>%
+  mutate(rhat_check = rhat > 1.001) %>%
+  summarise(rhat_1.001 = sum(rhat_check) / length(rhat), # proportion > 1.001
+            rhat_mean = mean(rhat),
+            rhat_sd = sd(rhat),
+            ess_mean = mean(ess_bulk),
+            ess_sd = sd(ess_bulk))
+# no rhat above 1.001
+# good effective sample size
+
+experimental_replication_samples$draws(format = "df") %>%
+  mcmc_rank_overlay() %>%
+  ggsave(filename = "replication_rank.pdf", path = here("Plots"),
+  width = 80, height = 40, unit = "cm", device = cairo_pdf)
+# chains look good
+
+# 4.2.4 Prior-posterior comparison ####
+# sample prior
+experimental_blank_prior <- prior_samples(
+  model = experimental_blank_mod,
+  data = experimental %>%
+    map(~ .x$blank) %>%
+    keep(~ nrow(.x) > 0) %>%
+    bind_rows() %>%
+    select(Fluorescence, Plate) %>%
+    compose_data(),
+  chains = 8, samples = 1e4)
+# prior_samples() doesn't fully support multilevel models but
+# for our visualisation purposes the messy samples are enough.
+
+# plot prior-posterior comparison
+experimental_blank_prior %>%
+    prior_posterior_draws(posterior_samples = experimental_blank_samples,
+                          group = experimental %>%
+                            map(~ .x$blank) %>%
+                            keep(~ nrow(.x) > 0) %>%
+                            bind_rows() %>%
+                            select(Plate),
+                          parameters = c("Fmu[Plate]", "Fmu_mu", "Fmu_sigma", "sigma"),
+                          format = "long") %>%
+  prior_posterior_plot(group_name = "Plate")
+# Note the fuzziness of the prior. Stan doesn't seem to be able to smoothly estimate
+# hierarchical priors.
+# For smooth prior distributions, generate in R:
+
+experimental_blank_prior <-
+  tibble(.chain = 1:8 %>% rep(each = 1e4),
+         .iteration = 1:1e4 %>% rep(8),
+         .draw = 1:8e4,
+         Fmu_mu = rnorm(8 * 1e4, log(200) , 1),
+         Fmu_sigma = rexp(8 * 1e4, 1),
+         Fmu = rnorm(8 * 1e4, Fmu_mu, Fmu_sigma),
+         sigma = rexp(8 * 1e4, 1)) %>%
+  pivot_longer(cols = -starts_with("."),
+               names_to = ".variable", values_to = ".value") %>%
+  mutate(rep = if_else(.variable == "Fmu", 24, 1), # there are 24 plates
+         .variable = fct_relevel(.variable, "Fmu")) %>%
+  uncount(rep) %>%
+  arrange(.variable) %>%
+  mutate(Plate = experimental %>%
+           map(~ .x$blank) %>%
+           keep(~ nrow(.x) > 0) %>%
+           bind_rows() %$% levels(Plate) %>%
+           rep(8 * 1e4) %>%
+           c(NA %>% rep(3 * 8 * 1e4)))
+
+experimental_blank_posterior <-
+  experimental_blank_samples %>%
+  recover_types(experimental %>%
+                  map(~ .x$blank) %>%
+                  keep(~ nrow(.x) > 0) %>%
+                  bind_rows() %>%
+                  select(Plate)) %>%
+  gather_draws(Fmu[Plate], Fmu_mu, Fmu_sigma, sigma) %>%
+  ungroup()
+
+experimental_blank_prior %>%
+  mutate(distribution = "prior") %>%
+  bind_rows(experimental_blank_posterior %>%
+              mutate(distribution = "posterior")) %>%
+  prior_posterior_plot(group_name = "Plate")
+# Not fuzzy. Everything fine.
+
+# 4.2.5 Predictions ####
+experimental_blank_predictions <-
+  experimental_blank_samples %>%
+  recover_types(experimental %>%
+                  map(~ .x$blank) %>%
+                  keep(~ nrow(.x) > 0) %>%
+                  bind_rows() %>%
+                  select(Plate)) %>%
+  spread_draws(Fmu[Plate], sigma) %>%
+  mutate(Fmu = exp(Fmu),
+         obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
+  select(-sigma) %>%
+  bind_rows(
+    experimental_blank_samples %>%
+      spread_draws(Fmu_mu, Fmu_sigma, sigma) %>%
+      mutate(Fmu = exp( rnorm(n(), Fmu_mu, Fmu_sigma) ),
+             obs = rgamma(n(), Fmu^2 / sigma^2, Fmu / sigma^2)) %>%
+      select(-c(Fmu_mu, Fmu_sigma, sigma))
+  ) %>%
+  pivot_longer(cols = c("Fmu", "obs"),
+               names_to = "level", values_to = "Fluorescence")
+
+experimental_blank_predictions %>%
+  ggplot(aes(Fluorescence, alpha = factor(level))) +
+    geom_density(colour = NA, fill = "black") +
+    scale_x_continuous(limits = c(0, 500), oob = scales::oob_keep) +
+    scale_alpha_manual(values = c(0.6, 0.2)) +
+    facet_wrap(~ Plate, scales = "free") +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+# It makes most sense to me to use Fmu here rather than predicted observations,
+# since we are replacing F0. That is while we want Fmu on the response scale, it is
+# to substitute another parameter so does not need to pass through the likelihood.
+experimental_blank_predictions %>%
+  filter(level == "Fmu") %>%
+  ggplot(aes(Fluorescence)) +
+    geom_density(colour = NA, fill = "black") +
+    scale_x_continuous(limits = c(0, 500), oob = scales::oob_keep) +
+    facet_wrap(~ Plate, scales = "free") +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
 
 
 
